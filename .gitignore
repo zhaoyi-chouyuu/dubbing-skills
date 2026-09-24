@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+joint_match_*
+.DS_Store
+._*
