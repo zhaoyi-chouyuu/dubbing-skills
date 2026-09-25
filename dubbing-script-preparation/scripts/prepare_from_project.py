@@ -437,6 +437,10 @@ def main() -> int:
         help="Local WeSpeaker or pyannote diarization pipeline used to create the mandatory Speaker01/Speaker02 preparation draft",
     )
     parser.add_argument("--anonymous-device", default="auto")
+    parser.add_argument(
+        "--workflow-track", choices=["standard", "experimental"], default="standard",
+        help="standard: original beta workflow; experimental: subtitle-guided anonymous segmentation",
+    )
     parser.add_argument("--identity-model", action="append", default=[])
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -481,6 +485,7 @@ def main() -> int:
                 "--feature-root", str(feature_root),
                 "--script-root", str(script_root),
                 "--frames-per-subtitle", str(args.frames_per_subtitle),
+                "--workflow-track", args.workflow_track,
             ]
             if args.main_skill_dir:
                 command.extend(["--main-skill-dir", args.main_skill_dir])

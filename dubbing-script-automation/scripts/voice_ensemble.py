@@ -200,7 +200,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         "evidence_models": list(active_models),
         "failed_models": sorted(failed_reports),
         "automatic_identity_assignment": False,
-        "workflow_version": "beta1.5wsl",
+        "workflow_version": "beta1.6",
         "wavlm_used": False,
     }, ensure_ascii=False, indent=2))
     return 0

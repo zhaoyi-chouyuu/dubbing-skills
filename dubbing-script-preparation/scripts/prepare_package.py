@@ -891,7 +891,7 @@ def build_package(args: argparse.Namespace) -> int:
         elif diarization_media is None:
             blocking.append(f"episode {episode}: no media is available for anonymous diarization")
         else:
-            anonymous_rc = run_tool(anonymous_tool, [
+            diarize_arguments = [
                 "diarize", "--episode", episode,
                 "--srt", str(packaged_srt),
                 "--media", str(diarization_media),
@@ -899,7 +899,10 @@ def build_package(args: argparse.Namespace) -> int:
                 "--device", args.anonymous_device,
                 "--ffmpeg", args.ffmpeg or default_ffmpeg(),
                 "--out-dir", str(anonymous_episode_dir),
-            ])
+            ]
+            if args.workflow_track == "experimental":
+                diarize_arguments.extend(["--segmentation", "subtitle"])
+            anonymous_rc = run_tool(anonymous_tool, diarize_arguments)
             if anonymous_rc != 0:
                 blocking.append(f"episode {episode}: anonymous speaker diarization failed")
 
@@ -997,6 +1000,7 @@ def build_package(args: argparse.Namespace) -> int:
                 else ("missing" if speech_audio_declared else "original_video_fallback")
             ),
             "anonymous_speaker_draft_status": "ready" if anonymous_rc == 0 else "blocked",
+            "anonymous_segmentation_mode": "subtitle_guided" if args.workflow_track == "experimental" else "sliding_window",
         }
         episode_qc_path = qc_episode_dir / "preparation_qc.json"
         write_json(episode_qc_path, episode_qc)
@@ -1099,7 +1103,8 @@ def build_package(args: argparse.Namespace) -> int:
         "schema_version": 11,
         "package_type": "dubbing-script-preparation",
         "workflow_stage": "beta",
-        "workflow_version": "beta1.5wsl",
+        "workflow_version": "beta1.6",
+        "workflow_track": args.workflow_track,
         "layout_version": 3,
         "package_layout": relative_path(layout_path, package),
         "preparation_ready": ready,
@@ -1262,6 +1267,10 @@ def main() -> int:
         help="Required local WeSpeaker or pyannote diarization pipeline for the preparation-stage Speaker01/Speaker02 draft",
     )
     parser.add_argument("--anonymous-device", default="auto")
+    parser.add_argument(
+        "--workflow-track", choices=["standard", "experimental"], default="standard",
+        help="standard: original beta workflow; experimental: subtitle-guided anonymous segmentation (see references/experimental-track.md)",
+    )
     parser.add_argument("--identity-model", action="append", default=[], help="Required three-model configuration: name=/absolute/path; repeat for campplus, ecapa512, resnet34")
     parser.add_argument(
         "--beta-voice-dir", "--diagnostic-voice-dir", dest="beta_voice_dir",

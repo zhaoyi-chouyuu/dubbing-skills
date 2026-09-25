@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -13,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import wave
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -219,16 +220,29 @@ def write_workbook(path: Path, rows: list[dict[str, Any]], title: str = "匿名S
     workbook.save(path)
 
 
+DIAGNOSTIC_FIELDS = [
+    "episode", "source_index", "start_timecode", "end_timecode", "segmentation_status",
+    "anonymous_speaker", "voiced_seconds", "window_count", "vad_fallback", "dual_dialogue_text",
+    "intra_cue_similarity", "cluster_similarity", "nearest_speaker", "nearest_similarity",
+]
+
+
 def build_outputs(
     episode: str,
     srt: Path,
     turns: list[dict[str, Any]],
     out_dir: Path,
     dominance_threshold: float,
+    subtitle_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cues = parse_srt(srt)
-    normalized_turns, source_mapping = normalize_speakers(turns)
-    mapped = map_cues(episode, cues, normalized_turns, dominance_threshold)
+    if subtitle_result is None:
+        normalized_turns, source_mapping = normalize_speakers(turns)
+        mapped = map_cues(episode, cues, normalized_turns, dominance_threshold)
+    else:
+        normalized_turns = subtitle_result["turns"]
+        source_mapping = subtitle_result["source_mapping"]
+        mapped = subtitle_result["mapped"]
     turn_fields = ["episode", "start_seconds", "end_seconds", "start_timecode", "end_timecode", "speaker", "source_speaker"]
     turn_rows = [{
         "episode": episode,
@@ -275,6 +289,11 @@ def build_outputs(
             "anonymous_script_xlsx": str(workbook_path.resolve()),
         },
     }
+    if subtitle_result is not None:
+        diagnostics_path = out_dir / "subtitle_segmentation_diagnostics.tsv"
+        write_tsv(diagnostics_path, subtitle_result["diagnostics"], DIAGNOSTIC_FIELDS)
+        report["outputs"]["subtitle_segmentation_diagnostics"] = str(diagnostics_path.resolve())
+        report.update(subtitle_result["report"])
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return report
 
@@ -528,17 +547,278 @@ def run_wespeaker_diarization(pipeline: dict[str, Any], waveform: Any, sample_ra
     return merge_labeled_segments([(begin, end, label) for (begin, end), label in zip(subsegs, labels)])
 
 
-def run_diarization(args: argparse.Namespace) -> list[dict[str, Any]]:
-    media_path = Path(args.media).resolve()
-    if not media_path.is_file():
-        raise DraftError(f"Speech-dominant media not found: {media_path}")
+DUAL_DIALOGUE_LINE_RE = re.compile(r"^\s*[-－‐‑–—]")
+
+
+def is_dual_dialogue_text(text: str) -> bool:
+    lines = [line for line in str(text).splitlines() if line.strip()]
+    return len(lines) >= 2 and sum(bool(DUAL_DIALOGUE_LINE_RE.match(line)) for line in lines) >= 2
+
+
+def voiced_intervals(start: float, end: float, speech: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    return [
+        (max(start, begin), min(end, finish))
+        for begin, finish in speech
+        if min(end, finish) > max(start, begin)
+    ]
+
+
+def unit_vector(np: Any, vector: Any) -> Any:
+    value = np.asarray(vector, dtype=np.float32).reshape(-1)
+    return value / max(float(np.linalg.norm(value)), 1e-8)
+
+
+def subtitle_cue_features(
+    pipeline: dict[str, Any],
+    waveform: Any,
+    sample_rate: int,
+    cues: list[dict[str, Any]],
+    min_cue_voiced: float,
+) -> list[dict[str, Any] | None]:
+    """Embed the voiced part of every trusted SRT cue with the diarization encoder."""
     import numpy as np
     import torch
-    device = resolve_device(args.device)
-    pipeline = load_local_pipeline(Path(args.pipeline), device)
-    if not isinstance(pipeline, dict):
-        pipeline.to(torch.device(device))
-    ffmpeg = Path(args.ffmpeg).resolve()
+    import torchaudio.compliance.kaldi as kaldi
+    from silero_vad import get_speech_timestamps
+
+    if sample_rate != 16000:
+        raise DraftError("WeSpeaker anonymous diarization expects 16000 Hz audio")
+    config = pipeline["config"]
+    speech = get_speech_timestamps(
+        waveform.squeeze(0),
+        pipeline["vad"],
+        sampling_rate=sample_rate,
+        min_speech_duration_ms=int(config.get("min_speech_duration_ms", 255)),
+        return_seconds=True,
+    )
+    spans = [(float(item["start"]), float(item["end"])) for item in speech]
+    window_frames = int(float(config.get("window_seconds", 1.5)) * 100)
+    period_frames = int(float(config.get("period_seconds", 0.75)) * 100)
+    media_seconds = waveform.shape[1] / sample_rate
+    windows: list[Any] = []
+    owners: list[int] = []
+    features: list[dict[str, Any] | None] = []
+    for position, cue in enumerate(cues):
+        start, end = max(0.0, float(cue["start"])), min(media_seconds, float(cue["end"]))
+        if end <= start:
+            features.append(None)
+            continue
+        voiced = voiced_intervals(start, end, spans)
+        voiced_seconds = sum(finish - begin for begin, finish in voiced)
+        fallback = voiced_seconds < min_cue_voiced
+        if fallback:
+            voiced, voiced_seconds = [(start, end)], end - start
+        pieces = []
+        for begin, finish in voiced:
+            chunk = waveform[:, int(begin * sample_rate):int(finish * sample_rate)].to(torch.float32)
+            if chunk.shape[1] < int(0.025 * sample_rate):
+                continue
+            pieces.append(kaldi.fbank(
+                chunk,
+                num_mel_bins=80,
+                frame_length=25,
+                frame_shift=10,
+                sample_frequency=sample_rate,
+                window_type="hamming",
+            ).numpy())
+        if not pieces:
+            features.append(None)
+            continue
+        frames = np.concatenate(pieces, axis=0)
+        count = frames.shape[0]
+        starts = [0] if count <= window_frames else list(range(0, count - window_frames + period_frames, period_frames))
+        first_window = len(windows)
+        for start_frame in starts:
+            window = np.resize(frames[start_frame:start_frame + window_frames], (window_frames, 80)).astype("float32", copy=False)
+            window -= np.mean(window, axis=0, keepdims=True)
+            windows.append(window)
+            owners.append(position)
+        features.append({
+            "voiced": voiced,
+            "voiced_seconds": voiced_seconds,
+            "vad_fallback": fallback,
+            "window_count": len(windows) - first_window,
+        })
+    if windows:
+        embeddings = np.concatenate([
+            pipeline["session"].run(["embs"], {"feats": np.stack(windows[offset:offset + 256])})[0]
+            for offset in range(0, len(windows), 256)
+        ])
+        grouped: dict[int, list[Any]] = defaultdict(list)
+        for owner, vector in zip(owners, embeddings):
+            grouped[owner].append(unit_vector(np, vector))
+        for position, vectors in grouped.items():
+            feature = features[position]
+            assert feature is not None
+            feature["embedding"] = unit_vector(np, np.sum(vectors, axis=0))
+            if len(vectors) >= 3:
+                middle = len(vectors) // 2
+                feature["halves"] = (
+                    unit_vector(np, np.sum(vectors[:middle], axis=0)),
+                    unit_vector(np, np.sum(vectors[middle:], axis=0)),
+                )
+    return features
+
+
+def assign_subtitle_speakers(
+    episode: str,
+    cues: list[dict[str, Any]],
+    features: list[dict[str, Any] | None],
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    """Cluster one embedding per trusted cue and flag cues that may contain two voices."""
+    import numpy as np
+
+    if len(features) != len(cues):
+        raise DraftError("Subtitle feature count does not match the SRT cue count")
+    states: list[dict[str, Any]] = []
+    clean: list[int] = []
+    for position, (cue, feature) in enumerate(zip(cues, features)):
+        dual = is_dual_dialogue_text(cue["text"])
+        intra = None
+        if feature and feature.get("halves") is not None:
+            first, second = feature["halves"]
+            intra = float(np.dot(unit_vector(np, first), unit_vector(np, second)))
+        if feature is None or feature.get("embedding") is None:
+            status = "no_speech_in_cue"
+        elif dual:
+            status = "dual_dialogue_cue"
+        elif intra is not None and intra < options["intra_change_threshold"]:
+            status = "intra_cue_change_suspected"
+        elif feature.get("vad_fallback"):
+            status = "low_voiced_review"
+        else:
+            status = "clean"
+            clean.append(position)
+        states.append({"status": status, "dual": dual, "intra": intra})
+
+    raw_labels: dict[int, str] = {}
+    if clean:
+        matrix = np.stack([unit_vector(np, features[position]["embedding"]) for position in clean])
+        if options.get("num_speakers"):
+            labels = spectral_cluster(matrix, int(options["num_speakers"]), options["min_speakers"], options["max_speakers"])
+        elif len(clean) == 2:
+            labels = [0, 0] if float(np.dot(matrix[0], matrix[1])) >= options["similarity_threshold"] else [0, 1]
+        else:
+            labels = agglomerative_cosine_cluster(matrix, options["similarity_threshold"])
+        raw_labels = {position: f"cluster_{label}" for position, label in zip(clean, labels)}
+    turns = [
+        {
+            "start": features[position]["voiced"][0][0],
+            "end": features[position]["voiced"][-1][1],
+            "speaker": raw_labels[position],
+        }
+        for position in clean
+    ]
+    normalized_turns, source_mapping = normalize_speakers(turns)
+    members: dict[str, list[int]] = defaultdict(list)
+    for position in clean:
+        members[raw_labels[position]].append(position)
+    sums = {
+        label: np.sum([unit_vector(np, features[position]["embedding"]) for position in positions], axis=0)
+        for label, positions in members.items()
+    }
+    centroids = {label: unit_vector(np, total) for label, total in sums.items()}
+
+    def nearest(vector: Any) -> tuple[str, float]:
+        if not centroids:
+            return "", float("nan")
+        probe = unit_vector(np, vector)
+        similarity, label = max((float(np.dot(probe, centroid)), label) for label, centroid in centroids.items())
+        return label, similarity
+
+    mapped: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for position, (cue, feature, state) in enumerate(zip(cues, features, states)):
+        status = state["status"]
+        label = "UNRESOLVED"
+        candidates: list[str] = []
+        cluster_similarity: float | None = None
+        nearest_label, nearest_similarity = "", float("nan")
+        if feature is not None and feature.get("embedding") is not None:
+            raw, nearest_similarity = nearest(feature["embedding"])
+            nearest_label = source_mapping.get(raw, "")
+        if status == "clean":
+            raw = raw_labels[position]
+            vector = unit_vector(np, feature["embedding"])
+            group_size = len(members[raw])
+            reference = unit_vector(np, sums[raw] - vector) if group_size >= 3 else centroids[raw]
+            cluster_similarity = float(np.dot(vector, reference))
+            label = source_mapping[raw]
+            candidates = [label]
+            outlier = group_size >= 3 and cluster_similarity < options["outlier_threshold"]
+            status = "cluster_outlier_review" if outlier else "single_speaker"
+        elif status in {"dual_dialogue_cue", "intra_cue_change_suspected"}:
+            label = "MULTI_SPEAKER_REVIEW"
+            probes = list(feature["halves"]) if feature.get("halves") is not None else [feature["embedding"]]
+            for probe in probes:
+                raw, _ = nearest(probe)
+                if raw and source_mapping[raw] not in candidates:
+                    candidates.append(source_mapping[raw])
+        elif status == "low_voiced_review":
+            if nearest_label and nearest_similarity >= options["outlier_threshold"]:
+                label = nearest_label
+                candidates = [label]
+            else:
+                status = "low_voiced_unresolved"
+        mapped.append({
+            "episode": episode,
+            "source_index": cue["source_index"],
+            "start_timecode": cue["start_timecode"],
+            "end_timecode": cue["end_timecode"],
+            "anonymous_speaker": label,
+            "speaker_candidates": "|".join(candidates),
+            "dominant_overlap_ratio": "1.0000" if status in {"single_speaker", "cluster_outlier_review"} else "0.0000",
+            "speaker_change_inside_cue": "true" if label == "MULTI_SPEAKER_REVIEW" else "false",
+            "diarization_status": status,
+            "text": cue["text"],
+        })
+        diagnostics.append({
+            "episode": episode,
+            "source_index": cue["source_index"],
+            "start_timecode": cue["start_timecode"],
+            "end_timecode": cue["end_timecode"],
+            "segmentation_status": status,
+            "anonymous_speaker": label,
+            "voiced_seconds": f"{feature['voiced_seconds']:.3f}" if feature else "0.000",
+            "window_count": feature.get("window_count", 0) if feature else 0,
+            "vad_fallback": "true" if feature and feature.get("vad_fallback") else "false",
+            "dual_dialogue_text": "true" if state["dual"] else "false",
+            "intra_cue_similarity": f"{state['intra']:.4f}" if state["intra"] is not None else "",
+            "cluster_similarity": f"{cluster_similarity:.4f}" if cluster_similarity is not None else "",
+            "nearest_speaker": nearest_label,
+            "nearest_similarity": f"{nearest_similarity:.4f}" if math.isfinite(nearest_similarity) else "",
+        })
+    counts = Counter(row["diarization_status"] for row in mapped)
+    report = {
+        "segmentation_mode": "subtitle_guided",
+        "workflow_track": "experimental",
+        "subtitle_segmentation": {
+            "status_counts": dict(sorted(counts.items())),
+            "clustered_cues": len(clean),
+            "similarity_threshold": options["similarity_threshold"],
+            "intra_change_threshold": options["intra_change_threshold"],
+            "outlier_threshold": options["outlier_threshold"],
+            "num_speakers": options.get("num_speakers") or "",
+            "rule": (
+                "Trusted SRT cues are the segmentation unit. Flagged cues require review and are "
+                "never split or rewritten automatically."
+            ),
+        },
+    }
+    return {
+        "turns": normalized_turns,
+        "source_mapping": source_mapping,
+        "mapped": mapped,
+        "diagnostics": diagnostics,
+        "report": report,
+    }
+
+
+def decode_media_waveform(media_path: Path, ffmpeg_value: str) -> tuple[Any, int]:
+    import numpy as np
+    import torch
+    ffmpeg = Path(ffmpeg_value).resolve()
     if not ffmpeg.is_file():
         raise DraftError(f"ffmpeg not found: {ffmpeg}")
     with tempfile.TemporaryDirectory(prefix="anonymous_diarization_") as temp_name:
@@ -560,18 +840,60 @@ def run_diarization(args: argparse.Namespace) -> list[dict[str, Any]]:
             channels = handle.getnchannels()
             width = handle.getsampwidth()
             raw = handle.readframes(handle.getnframes())
-        if channels != 1 or width != 2:
-            raise DraftError("Decoded diarization audio is not mono 16-bit PCM")
-        samples = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
-        waveform = torch.from_numpy(samples).unsqueeze(0)
-        if isinstance(pipeline, dict):
-            return run_wespeaker_diarization(pipeline, waveform, sample_rate)
-        annotation = pipeline({"waveform": waveform, "sample_rate": sample_rate})
+    if channels != 1 or width != 2:
+        raise DraftError("Decoded diarization audio is not mono 16-bit PCM")
+    samples = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
+    return torch.from_numpy(samples).unsqueeze(0), sample_rate
+
+
+def run_diarization(args: argparse.Namespace) -> list[dict[str, Any]]:
+    media_path = Path(args.media).resolve()
+    if not media_path.is_file():
+        raise DraftError(f"Speech-dominant media not found: {media_path}")
+    import torch
+    device = resolve_device(args.device)
+    pipeline = load_local_pipeline(Path(args.pipeline), device)
+    if not isinstance(pipeline, dict):
+        pipeline.to(torch.device(device))
+    waveform, sample_rate = decode_media_waveform(media_path, args.ffmpeg)
+    if isinstance(pipeline, dict):
+        return run_wespeaker_diarization(pipeline, waveform, sample_rate)
+    annotation = pipeline({"waveform": waveform, "sample_rate": sample_rate})
     return [
         {"start": start, "end": end, "speaker": speaker}
         for start, end, speaker in iter_annotation(annotation)
         if end > start
     ]
+
+
+def run_subtitle_guided(args: argparse.Namespace) -> dict[str, Any]:
+    media_path = Path(args.media).resolve()
+    if not media_path.is_file():
+        raise DraftError(f"Speech-dominant media not found: {media_path}")
+    device = resolve_device(args.device)
+    pipeline = load_local_pipeline(Path(args.pipeline), device)
+    if not isinstance(pipeline, dict):
+        raise DraftError("Subtitle-guided segmentation requires the local WeSpeaker ONNX + Silero VAD pipeline")
+    waveform, sample_rate = decode_media_waveform(media_path, args.ffmpeg)
+    cues = parse_srt(Path(args.srt))
+    config = pipeline["config"]
+    threshold = (
+        args.cue_similarity_threshold
+        if args.cue_similarity_threshold is not None
+        else float(config.get("speaker_similarity_threshold", 0.70))
+    )
+    if not 0.0 < threshold < 1.0:
+        raise DraftError("Cue similarity threshold must be between 0 and 1")
+    configured = config.get("num_speakers")
+    features = subtitle_cue_features(pipeline, waveform, sample_rate, cues, args.min_cue_voiced)
+    return assign_subtitle_speakers(args.episode, cues, features, {
+        "similarity_threshold": threshold,
+        "num_speakers": int(configured) if configured not in (None, "") else None,
+        "min_speakers": int(config.get("min_speakers", 1)),
+        "max_speakers": int(config.get("max_speakers", 20)),
+        "intra_change_threshold": args.intra_cue_change_threshold,
+        "outlier_threshold": args.cluster_outlier_threshold,
+    })
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -584,6 +906,14 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 
 def cmd_diarize(args: argparse.Namespace) -> int:
+    if args.segmentation == "subtitle":
+        result = run_subtitle_guided(args)
+        report = build_outputs(
+            args.episode, Path(args.srt), [], Path(args.out_dir), args.dominance_threshold,
+            subtitle_result=result,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["ready"] else 2
     turns = run_diarization(args)
     report = build_outputs(args.episode, Path(args.srt), turns, Path(args.out_dir), args.dominance_threshold)
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -695,6 +1025,14 @@ def build_parser() -> argparse.ArgumentParser:
     diarize.add_argument("--pipeline", required=True)
     diarize.add_argument("--device", default="auto")
     diarize.add_argument("--ffmpeg", default=default_ffmpeg())
+    diarize.add_argument(
+        "--segmentation", choices=["window", "subtitle"], default="window",
+        help="window: standard sliding-window diarization; subtitle: experimental one-embedding-per-trusted-SRT-cue clustering",
+    )
+    diarize.add_argument("--cue-similarity-threshold", type=float, help="Experimental cue clustering threshold; defaults to the pipeline speaker_similarity_threshold")
+    diarize.add_argument("--intra-cue-change-threshold", type=float, default=0.50, help="Experimental: first-half/second-half similarity below this flags a possible speaker change inside one cue")
+    diarize.add_argument("--cluster-outlier-threshold", type=float, default=0.45, help="Experimental: cue-to-own-cluster similarity below this flags the cue for review")
+    diarize.add_argument("--min-cue-voiced", type=float, default=0.30, help="Experimental: minimum VAD speech seconds inside a cue before it is clustered")
     diarize.set_defaults(func=cmd_diarize)
     preflight = subparsers.add_parser("preflight", help="Check the anonymous-segmentation and three-model identity stack")
     preflight.add_argument("--pipeline", required=True)
@@ -718,6 +1056,10 @@ def main() -> int:
     try:
         if not 0.5 <= getattr(args, "dominance_threshold", 0.70) <= 1.0:
             raise DraftError("--dominance-threshold must be between 0.5 and 1.0")
+        for name in ("intra_cue_change_threshold", "cluster_outlier_threshold"):
+            value = getattr(args, name, None)
+            if value is not None and not 0.0 < value < 1.0:
+                raise DraftError(f"--{name.replace('_', '-')} must be between 0 and 1")
         return args.func(args)
     except (OSError, ValueError, DraftError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

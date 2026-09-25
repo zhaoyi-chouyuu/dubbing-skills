@@ -14,6 +14,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = "3"
-SKILL_VERSION = "beta1.5wsl"
+SKILL_VERSION = "beta1.6"
 MODEL_KINDS = ("resnet34", "campplus", "ecapa512")
 GENERIC_ROLE_MARKERS = (
     "男性音声", "女性音声", "子供音声", "老人男性音声", "老人女性音声",
@@ -250,6 +251,20 @@ def rank_candidates(np: Any, vector: Any, roles: list[str], centroids: Any):
     )
 
 
+def rank_gallery_roles(np: Any, vector: Any, gallery: dict[str, Any]):
+    if gallery.get("scoring_mode") != "exemplar_max":
+        return rank_candidates(np, vector, gallery["roles"], gallery["centroids"])
+    best: dict[str, float] = {}
+    for role, exemplar in zip(gallery["exemplar_roles"], gallery["exemplars"]):
+        value = float(np.dot(vector, exemplar))
+        if value > best.get(role, -2.0):
+            best[role] = value
+    return sorted(
+        ((role, best[role]) for role in gallery["roles"] if role in best),
+        key=lambda item: item[1], reverse=True,
+    )
+
+
 def extract_audio(media: Path, start: str, end: str, output: Path, ffmpeg_bin: str) -> float:
     if not media.is_file():
         raise VoiceError(f"Media not found: {media}")
@@ -415,6 +430,12 @@ def gallery_payload(np: Any, path: Path) -> dict[str, Any]:
         result["role_similarity_thresholds"] = dict(zip(roles, [float(x) for x in data["role_similarity_thresholds"].tolist()]))
     if "role_margin_thresholds" in data.files:
         result["role_margin_thresholds"] = dict(zip(roles, [float(x) for x in data["role_margin_thresholds"].tolist()]))
+    result["scoring_mode"] = str(data["scoring_mode"].tolist()[0]) if "scoring_mode" in data.files else "centroid"
+    if result["scoring_mode"] == "exemplar_max":
+        if "exemplars" not in data.files or "exemplar_roles" not in data.files:
+            raise VoiceError(f"Exemplar gallery lacks stored exemplars: {path}")
+        result["exemplars"] = data["exemplars"]
+        result["exemplar_roles"] = [str(item) for item in data["exemplar_roles"].tolist()]
     return result
 
 
@@ -458,6 +479,7 @@ def build_gallery_arrays(np: Any, grouped: dict[str, list[dict[str, Any]]], args
         issues.append({"role": "", "issue": "gallery_requires_at_least_two_valid_roles"})
         return roles, None, None, None, audit_updates, retained, issues
     centroids_map = {role: normalize(np, np.mean([item["vector"] for item in retained[role]], axis=0)) for role in valid_roles}
+    exemplar_mode = getattr(args, "scoring_mode", "centroid") == "exemplar_max"
     similarity_thresholds: list[float] = []
     margin_thresholds: list[float] = []
     for role in valid_roles:
@@ -467,9 +489,17 @@ def build_gallery_arrays(np: Any, grouped: dict[str, list[dict[str, Any]]], args
         records = retained[role]
         for position, item in enumerate(records):
             others = [entry["vector"] for index, entry in enumerate(records) if index != position]
-            same_centroid = normalize(np, np.mean(others, axis=0)) if others else centroids_map[role]
-            same = float(np.dot(item["vector"], same_centroid))
-            other = max(float(np.dot(item["vector"], centroids_map[name])) for name in valid_roles if name != role)
+            if exemplar_mode:
+                # Leave-one-out calibration against the nearest stored exemplar, matching score-time ranking.
+                same = max((float(np.dot(item["vector"], vector)) for vector in others), default=-1.0)
+                other = max(
+                    float(np.dot(item["vector"], entry["vector"]))
+                    for name in valid_roles if name != role for entry in retained[name]
+                )
+            else:
+                same_centroid = normalize(np, np.mean(others, axis=0)) if others else centroids_map[role]
+                same = float(np.dot(item["vector"], same_centroid))
+                other = max(float(np.dot(item["vector"], centroids_map[name])) for name in valid_roles if name != role)
             genuine.append(same)
             impostors.append(other)
             margins.append(same - other)
@@ -494,9 +524,9 @@ def build_gallery_arrays(np: Any, grouped: dict[str, list[dict[str, Any]]], args
 
 def cmd_build_gallery(args: argparse.Namespace) -> int:
     if args.allow_unverified:
-        raise VoiceError("--allow-unverified is disabled in beta1.5: manual identity confirmation is required")
+        raise VoiceError("--allow-unverified is disabled in beta1.6: manual identity confirmation is required")
     if args.min_clips_per_role < 3 or args.min_episodes_per_role < 1 or args.min_total_duration_per_role < 8:
-        raise VoiceError("beta1.5 minimum enrollment is 3 clips, 1 confirmed episode and 8 seconds per role")
+        raise VoiceError("beta1.6 minimum enrollment is 3 clips, 1 confirmed episode and 8 seconds per role")
     np, inference, device = load_runtime(Path(args.model), args.device, args.model_kind)
     manifest = Path(args.manifest)
     rows = read_tsv(manifest)
@@ -633,7 +663,8 @@ def cmd_build_gallery(args: argparse.Namespace) -> int:
         "separator_ids": separator_ids,
         "gallery_issues": gallery_issues,
         "clip_issues": manifest_issues,
-        "workflow_stage": "beta1.5wsl",
+        "workflow_stage": "beta1.6",
+        "scoring_mode": args.scoring_mode,
         "voice_evidence_authority": "supporting",
         "automatic_identity_assignment": False,
         "gallery_ready": gallery_ready,
@@ -653,13 +684,24 @@ def cmd_build_gallery(args: argparse.Namespace) -> int:
         raise VoiceError("Gallery has insufficient valid roles")
     model_path = Path(args.model)
     model_fingerprint = path_fingerprint(model_path)[:16]
+    exemplar_mode = args.scoring_mode == "exemplar_max"
     gallery_id = hashlib.sha256(
-        (file_sha256(manifest) + model_fingerprint + json.dumps(usable_roles, ensure_ascii=False)).encode("utf-8")
+        (
+            file_sha256(manifest) + model_fingerprint + json.dumps(usable_roles, ensure_ascii=False)
+            + ("|exemplar_max" if exemplar_mode else "")
+        ).encode("utf-8")
     ).hexdigest()[:16]
     out = Path(args.out_gallery)
     if out.exists() and not args.overwrite:
         raise VoiceError(f"Output exists: {out}. Use --overwrite or a new path.")
     out.parent.mkdir(parents=True, exist_ok=True)
+    exemplar_arrays: dict[str, Any] = {}
+    if exemplar_mode:
+        exemplar_arrays = {
+            "scoring_mode": np.asarray(["exemplar_max"]),
+            "exemplars": np.stack([item["vector"] for role in usable_roles for item in retained[role]]),
+            "exemplar_roles": np.asarray([role for role in usable_roles for _ in retained[role]]),
+        }
     np.savez_compressed(
         out,
         schema_version=np.asarray([SCHEMA_VERSION]),
@@ -675,6 +717,7 @@ def cmd_build_gallery(args: argparse.Namespace) -> int:
         role_similarity_thresholds=np.asarray(sim_thresholds, dtype=np.float32),
         role_margin_thresholds=np.asarray(margin_thresholds, dtype=np.float32),
         role_clip_counts=np.asarray([len(retained[role]) for role in usable_roles], dtype=np.int32),
+        **exemplar_arrays,
     )
     print(json.dumps({"gallery": str(out), "gallery_id": gallery_id, "roles": len(usable_roles), "usable_roles": usable_roles, "accepted_clips": report["accepted_clips"], "device": device}, ensure_ascii=False))
     return 0
@@ -834,7 +877,6 @@ VOICE_OUTPUT_FIELDS = [
 
 def score_manifest_rows(rows: list[dict[str, str]], gallery: dict[str, Any], np: Any, inference: Any, args: argparse.Namespace) -> list[dict[str, Any]]:
     roles = gallery["roles"]
-    centroids = gallery["centroids"]
     output: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="voice_score_") as temp:
         temp_dir = Path(temp)
@@ -858,7 +900,7 @@ def score_manifest_rows(rows: list[dict[str, str]], gallery: dict[str, Any], np:
                         if actual_duration < args.min_duration:
                             status, reason = "too_short", f"duration below {args.min_duration:.3f}s"
                         else:
-                            ranked = rank_candidates(np, vector, roles, centroids)
+                            ranked = rank_gallery_roles(np, vector, gallery)
                             candidate, top1 = ranked[0]
                             second, top2 = ranked[1] if len(ranked) > 1 else ("", -1.0)
                             similarity, second_similarity, margin = f"{top1:.6f}", f"{top2:.6f}", f"{top1 - top2:.6f}"
@@ -900,6 +942,209 @@ def score_manifest_rows(rows: list[dict[str, str]], gallery: dict[str, Any], np:
                 "voice_gallery_roles": "|".join(roles),
             })
     return output
+
+
+CLUSTER_ROW_FIELDS = [
+    "episode", "source_index", "anonymous_speaker", "acoustic_turn_id", "row_status",
+    "row_duration", "row_cluster_similarity", "row_voice_candidate", "row_voice_similarity",
+    "row_voice_margin", "row_outlier", "row_reason", "voice_model_kind", "voice_gallery_id",
+]
+ANONYMOUS_SPEAKER_RE = re.compile(r"Speaker[0-9]{2,}")
+
+
+def voice_gates(gallery: dict[str, Any], candidate: str, args: argparse.Namespace) -> tuple[float, float]:
+    return (
+        max(args.min_similarity, float(gallery["role_similarity_thresholds"].get(candidate, 0.0))),
+        max(args.min_margin, float(gallery["role_margin_thresholds"].get(candidate, 0.0))),
+    )
+
+
+def score_cluster_rows(
+    rows: list[dict[str, str]],
+    media: Path,
+    episode: str,
+    gallery: dict[str, Any],
+    np: Any,
+    embed: Any,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Score each episode-local Speaker cluster as one duration-weighted aggregate.
+
+    The result is a candidate for the whole cluster plus per-row outlier flags; it
+    never assigns a role.  Rows the diarization step did not mark single_speaker
+    stay outside every aggregate and require row-level review.
+    """
+    episode_label = str(episode).strip()
+    episode_key = canonical_episode(episode_label)
+    if not episode_key:
+        raise VoiceError("Cluster scoring requires an evaluation episode")
+    leakage = episode_key in {canonical_episode(item) for item in gallery.get("enrollment_episodes", [])}
+    clusters: dict[str, list[dict[str, Any]]] = {}
+    details: list[dict[str, Any]] = []
+    for row in rows:
+        if canonical_episode(row.get("episode")) != episode_key:
+            raise VoiceError(f"Anonymous script row {row.get('source_index')} belongs to another episode")
+        speaker = (row.get("anonymous_speaker") or "").strip()
+        diarization_status = (row.get("diarization_status") or "").strip()
+        detail: dict[str, Any] = {
+            "episode": row.get("episode", ""),
+            "source_index": (row.get("source_index") or "").strip(),
+            "anonymous_speaker": speaker, "acoustic_turn_id": "", "row_status": "",
+            "row_duration": "", "row_cluster_similarity": "", "row_voice_candidate": "",
+            "row_voice_similarity": "", "row_voice_margin": "", "row_outlier": "unknown", "row_reason": "",
+            "voice_model_kind": gallery.get("model_kind", ""), "voice_gallery_id": gallery["gallery_id"],
+        }
+        details.append(detail)
+        if not ANONYMOUS_SPEAKER_RE.fullmatch(speaker) or diarization_status != "single_speaker":
+            detail.update(row_status="needs_row_review", row_reason=f"diarization_status={diarization_status or 'missing'}")
+            continue
+        detail["acoustic_turn_id"] = f"cluster:{episode_label}:{speaker}"
+        clusters.setdefault(speaker, []).append({"row": row, "detail": detail})
+
+    output: list[dict[str, Any]] = []
+    for speaker, members in clusters.items():
+        candidate = second = similarity = second_similarity = margin = error = ""
+        total_seconds = 0.0
+        accepted: list[dict[str, Any]] = []
+        if leakage:
+            status, reason = "same_episode_leakage", "evaluation episode occurs in enrollment gallery"
+            for member in members:
+                member["detail"].update(row_status="same_episode_leakage", row_reason=reason)
+        else:
+            failures: list[str] = []
+            for member in members:
+                row, detail = member["row"], member["detail"]
+                clip = {"media_path": str(media), "start": row.get("start_timecode", ""), "end": row.get("end_timecode", "")}
+                try:
+                    vector, duration, _ = embed(clip)
+                except VoiceError as exc:
+                    text = str(exc)
+                    kind = "low_quality" if text.startswith("audio_quality:") else "error"
+                    failures.append(kind if kind == "low_quality" else text)
+                    detail.update(row_status=kind, row_reason=text)
+                    continue
+                detail["row_duration"] = f"{duration:.3f}"
+                if duration < args.min_cue_duration:
+                    detail.update(row_status="too_short", row_reason=f"duration below {args.min_cue_duration:.3f}s")
+                    continue
+                accepted.append({"vector": vector, "duration": duration, "detail": detail})
+            total_seconds = sum(item["duration"] for item in accepted)
+            if not accepted:
+                errors = [value for value in failures if value != "low_quality"]
+                if errors:
+                    status, reason, error = "error", "embedding_or_audio_extraction_failed", errors[0]
+                elif failures:
+                    status, reason = "low_quality", "no cluster row passed the audio-quality gate"
+                else:
+                    status, reason = "too_short", f"no cluster row reached {args.min_cue_duration:.3f}s"
+            elif total_seconds < args.min_cluster_seconds:
+                status, reason = "too_short", f"accepted cluster speech {total_seconds:.3f}s below {args.min_cluster_seconds:.3f}s"
+            else:
+                weighted_sum = np.sum([item["vector"] * item["duration"] for item in accepted], axis=0)
+                aggregate = normalize(np, weighted_sum)
+                ranked = rank_gallery_roles(np, aggregate, gallery)
+                candidate, top1 = ranked[0]
+                second, top2 = ranked[1] if len(ranked) > 1 else ("", -1.0)
+                similarity, second_similarity, margin = f"{top1:.6f}", f"{top2:.6f}", f"{top1 - top2:.6f}"
+                sim_gate, margin_gate = voice_gates(gallery, candidate, args)
+                agreeing = 0
+                for item in accepted:
+                    detail = item["detail"]
+                    row_ranked = rank_gallery_roles(np, item["vector"], gallery)
+                    row_candidate, row_top1 = row_ranked[0]
+                    row_top2 = row_ranked[1][1] if len(row_ranked) > 1 else -1.0
+                    cluster_similarity: float | None = None
+                    if len(accepted) > 1:
+                        rest = weighted_sum - item["vector"] * item["duration"]
+                        if float(np.linalg.norm(rest)) > 1e-8:
+                            cluster_similarity = float(np.dot(item["vector"], normalize(np, rest)))
+                    row_sim_gate, row_margin_gate = voice_gates(gallery, row_candidate, args)
+                    strong_disagreement = (
+                        row_candidate != candidate and row_top1 >= row_sim_gate
+                        and row_top1 - row_top2 >= row_margin_gate
+                    )
+                    weak_member = cluster_similarity is not None and cluster_similarity < args.row_outlier_threshold
+                    agreeing += int(row_candidate == candidate)
+                    detail.update(
+                        row_status="scored",
+                        row_cluster_similarity=f"{cluster_similarity:.6f}" if cluster_similarity is not None else "",
+                        row_voice_candidate=row_candidate,
+                        row_voice_similarity=f"{row_top1:.6f}",
+                        row_voice_margin=f"{row_top1 - row_top2:.6f}",
+                        row_outlier="true" if strong_disagreement or weak_member else "false",
+                        row_reason=(
+                            "row voice strongly prefers another role" if strong_disagreement
+                            else "row is far from the rest of its cluster" if weak_member
+                            else "consistent with cluster"
+                        ),
+                    )
+                agreement = agreeing / len(accepted)
+                if top1 < sim_gate:
+                    status, reason = "low_similarity", f"cluster top1 {top1:.4f} below gate {sim_gate:.4f}"
+                elif top1 - top2 < margin_gate:
+                    status, reason = "ambiguous", f"cluster margin {top1 - top2:.4f} below gate {margin_gate:.4f}"
+                elif agreement < args.min_row_agreement:
+                    status, reason = "ambiguous", f"row agreement {agreement:.2f} below {args.min_row_agreement:.2f}"
+                else:
+                    status, reason = "eligible", (
+                        f"cluster passed similarity {sim_gate:.4f} and margin {margin_gate:.4f} gates; "
+                        f"row agreement {agreement:.2f} over {len(accepted)} rows / {total_seconds:.1f}s"
+                    )
+        keep = status == "eligible" or status in ADVISORY_STATUSES
+        output.append({
+            "episode": episode_label,
+            "source_indices": ",".join(member["detail"]["source_index"] for member in members),
+            "semantic_unit": "",
+            "acoustic_turn_id": f"cluster:{episode_label}:{speaker}",
+            "acoustic_reviewed_by": "subtitle-guided-cluster",
+            "expected_role": "",
+            "voice_status": status,
+            "voice_candidate": candidate if keep else "",
+            "voice_similarity": similarity if keep else "",
+            "voice_second_candidate": second if keep else "",
+            "voice_second_similarity": second_similarity if keep else "",
+            "voice_margin": margin if keep else "",
+            "voice_duration": f"{total_seconds:.3f}",
+            "voice_quality_rms_dbfs": "", "voice_quality_active_ratio": "", "voice_quality_clipping_ratio": "",
+            "voice_decision_reason": reason,
+            "voice_gallery_id": gallery["gallery_id"],
+            "voice_error": error,
+            "voice_model_kind": gallery.get("model_kind", ""),
+            "voice_model_fingerprint": gallery.get("model_fingerprint", ""),
+            "voice_gallery_roles": "|".join(gallery["roles"]),
+        })
+    return output, details
+
+
+def cmd_score_clusters(args: argparse.Namespace) -> int:
+    np, inference, device = load_runtime(Path(args.model), args.device, args.model_kind)
+    gallery = gallery_payload(np, Path(args.gallery))
+    validate_gallery_model(gallery, Path(args.model), args.model_kind)
+    rows = read_tsv(Path(args.anonymous_script))
+    media = Path(args.media).resolve()
+    if not media.is_file():
+        raise VoiceError(f"Media not found: {media}")
+    with tempfile.TemporaryDirectory(prefix="voice_clusters_") as temp:
+        temp_dir = Path(temp)
+        clusters, details = score_cluster_rows(
+            rows, media, str(args.episode), gallery, np,
+            lambda clip: embed_row(np, inference, clip, temp_dir, args), args,
+        )
+    write_tsv(Path(args.out_tsv), clusters, VOICE_OUTPUT_FIELDS, args.overwrite)
+    write_tsv(Path(args.out_rows_tsv), details, CLUSTER_ROW_FIELDS, args.overwrite)
+    print(json.dumps({
+        "output": args.out_tsv,
+        "row_output": args.out_rows_tsv,
+        "clusters": len(clusters),
+        "statuses": dict(Counter(row["voice_status"] for row in clusters)),
+        "row_outliers": sum(row["row_outlier"] == "true" for row in details),
+        "rows_needing_row_review": sum(row["row_outlier"] != "false" for row in details),
+        "gallery_id": gallery["gallery_id"],
+        "scoring_mode": gallery.get("scoring_mode", "centroid"),
+        "device": device,
+        "automatic_identity_assignment": False,
+    }, ensure_ascii=False))
+    return 0
 
 
 def cmd_score(args: argparse.Namespace) -> int:
@@ -1094,7 +1339,65 @@ def cmd_self_test(_: argparse.Namespace) -> int:
     legacy = [dict(labels[0], semantic_unit=""), dict(labels[1], semantic_unit="")]
     inferred = resolve_semantic_unit_ids(legacy)
     assert set(inferred) == {"1", "2"} and all(inferred.values())
-    print("Self-test passed: ranking, semantic-unit fallback, acoustic-turn gating/merge, generic-role gating, duration gating, and episode-leakage protection are valid.")
+
+    # Experimental exemplar gallery: nearest stored clip wins even when the role mean is far away.
+    exemplar_gallery = {
+        "roles": ["A", "B"], "scoring_mode": "exemplar_max",
+        "centroids": np.stack([normalize(np, [1.0, 0.0, 1.0]), normalize(np, [0.0, 0.6, 0.8])]),
+        "exemplars": np.stack([normalize(np, [1.0, 0.0, 0.0]), normalize(np, [0.0, 0.0, 1.0]), normalize(np, [0.0, 0.6, 0.8])]),
+        "exemplar_roles": ["A", "A", "B"],
+    }
+    assert rank_gallery_roles(np, normalize(np, [0.1, 0.1, 1.0]), exemplar_gallery)[0][0] == "A"
+    assert rank_gallery_roles(np, normalize(np, [0.1, 0.1, 1.0]), dict(exemplar_gallery, scoring_mode="centroid"))[0][0] == "B"
+
+    # Experimental cluster scoring with a deterministic fake encoder.
+    cluster_gallery = {
+        "roles": ["A", "B"], "enrollment_episodes": ["1"], "gallery_id": "g", "model_kind": "campplus",
+        "model_fingerprint": "f", "centroids": np.stack([normalize(np, [1.0, 0.0, 0.0]), normalize(np, [0.0, 1.0, 0.0])]),
+        "role_similarity_thresholds": {"A": 0.5, "B": 0.5}, "role_margin_thresholds": {"A": 0.1, "B": 0.1},
+    }
+    vectors = {
+        "00:00:01,000": ([1.0, 0.05, 0.0], 1.5), "00:00:03,000": ([0.95, 0.1, 0.05], 1.2),
+        "00:00:05,000": ([0.0, 1.0, 0.0], 1.4), "00:00:07,000": ([1.0, 0.0, 0.1], 0.3),
+        "00:00:09,000": ([0.0, 1.0, 0.1], 2.5), "00:00:11,000": ([0.1, 1.0, 0.0], 2.0),
+    }
+
+    def fake_embed(clip: dict[str, str]):
+        vector, duration = vectors[clip["start"]]
+        return normalize(np, vector), duration, {}
+
+    script = [
+        {"episode": "0002", "source_index": str(i + 1), "anonymous_speaker": speaker, "diarization_status": status,
+         "start_timecode": start, "end_timecode": start.replace(",000", ",900")}
+        for i, (speaker, status, start) in enumerate([
+            ("Speaker01", "single_speaker", "00:00:01,000"), ("Speaker01", "single_speaker", "00:00:03,000"),
+            ("Speaker01", "single_speaker", "00:00:05,000"), ("Speaker01", "single_speaker", "00:00:07,000"),
+            ("Speaker02", "single_speaker", "00:00:09,000"), ("Speaker02", "single_speaker", "00:00:11,000"),
+            ("MULTI_SPEAKER_REVIEW", "dual_dialogue_cue", "00:00:13,000"),
+        ])
+    ]
+    cluster_args = argparse.Namespace(
+        min_cue_duration=0.5, min_cluster_seconds=3.0, min_row_agreement=0.6, row_outlier_threshold=0.4,
+        min_similarity=0.35, min_margin=0.08,
+    )
+    cluster_rows, row_details = score_cluster_rows(script, Path(__file__), "0002", cluster_gallery, np, fake_embed, cluster_args)
+    by_turn = {row["acoustic_turn_id"]: row for row in cluster_rows}
+    assert by_turn["cluster:0002:Speaker01"]["voice_status"] == "eligible"
+    assert by_turn["cluster:0002:Speaker01"]["voice_candidate"] == "A"
+    assert by_turn["cluster:0002:Speaker01"]["source_indices"] == "1,2,3,4"
+    assert by_turn["cluster:0002:Speaker02"]["voice_candidate"] == "B"
+    detail = {row["source_index"]: row for row in row_details}
+    assert detail["3"]["row_outlier"] == "true", "a B-sounding row inside an A cluster must be flagged"
+    assert detail["1"]["row_outlier"] == "false"
+    assert detail["4"]["row_status"] == "too_short" and detail["4"]["row_outlier"] == "unknown"
+    assert detail["7"]["row_status"] == "needs_row_review"
+    leak_script = [dict(row, episode="0001") for row in script]
+    leak_clusters, _ = score_cluster_rows(leak_script, Path(__file__), "0001", cluster_gallery, np, fake_embed, cluster_args)
+    assert all(row["voice_status"] == "same_episode_leakage" for row in leak_clusters)
+    print(
+        "Self-test passed: ranking, semantic-unit fallback, acoustic-turn gating/merge, generic-role gating, duration gating, "
+        "episode-leakage protection, exemplar ranking, and cluster scoring/outlier flags are valid."
+    )
     return 0
 
 
@@ -1130,6 +1433,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--beta", "--diagnostic", dest="beta", action="store_true", default=True,
         help="Build the user-confirmed Beta supporting-evidence gallery (--diagnostic is a legacy alias)",
     )
+    gallery.add_argument(
+        "--scoring-mode", choices=["centroid", "exemplar_max"], default="centroid",
+        help="centroid: standard one averaged profile per role; exemplar_max: experimental, keep every accepted clip and score against the nearest one",
+    )
     gallery.add_argument("--overwrite", action="store_true")
     add_quality_arguments(gallery)
     gallery.set_defaults(func=cmd_build_gallery)
@@ -1154,6 +1461,26 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--overwrite", action="store_true")
     add_score_arguments(score)
     score.set_defaults(func=cmd_score)
+
+    clusters = sub.add_parser(
+        "score-clusters",
+        help="Experimental: score each episode-local anonymous Speaker cluster as one aggregate and flag outlier rows",
+    )
+    clusters.add_argument("--anonymous-script", required=True, help="Preparation anonymous_script.tsv built with subtitle-guided segmentation")
+    clusters.add_argument("--media", required=True)
+    clusters.add_argument("--episode", required=True)
+    clusters.add_argument("--gallery", required=True)
+    clusters.add_argument("--model", required=True)
+    clusters.add_argument("--model-kind", choices=MODEL_KINDS, default="resnet34")
+    clusters.add_argument("--out-tsv", required=True, help="One ensemble-compatible evidence row per cluster")
+    clusters.add_argument("--out-rows-tsv", required=True, help="Per-row cluster membership, row candidate and outlier flag")
+    clusters.add_argument("--min-cue-duration", type=float, default=0.5)
+    clusters.add_argument("--min-cluster-seconds", type=float, default=3.0)
+    clusters.add_argument("--min-row-agreement", type=float, default=0.6)
+    clusters.add_argument("--row-outlier-threshold", type=float, default=0.40)
+    clusters.add_argument("--overwrite", action="store_true")
+    add_score_arguments(clusters)
+    clusters.set_defaults(func=cmd_score_clusters)
 
     probe = sub.add_parser("probe", help="Compare one reviewed single-speaker acoustic turn with a leakage-safe gallery")
     probe.add_argument("--media", required=True)

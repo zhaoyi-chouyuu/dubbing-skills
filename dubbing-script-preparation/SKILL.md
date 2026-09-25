@@ -1,15 +1,24 @@
 ---
 name: dubbing-script-preparation
-description: Discover, prepare, and validate Japanese short-drama dubbing materials for the single beta1.5wsl workflow from semantically organized project folders whose names and contents may vary. It finds video, subtitle, script, casting, and related source areas by meaning and evidence, creates episode-local anonymous Speaker drafts, and optionally delivers a Japanese preliminary cast overview before speaker-role review.
+description: Discover, prepare, and validate Japanese short-drama dubbing materials for the beta1.6 workflow (standard track, or the opt-in experimental track with subtitle-guided speaker segmentation) from semantically organized project folders whose names and contents may vary. It finds video, subtitle, script, casting, and related source areas by meaning and evidence, creates episode-local anonymous Speaker drafts, and optionally delivers a Japanese preliminary cast overview before speaker-role review.
 metadata:
-  version: "beta1.5wsl"
+  version: "beta1.6"
 ---
 
-# Dubbing Script Preparation — beta1.5wsl
+# Dubbing Script Preparation — beta1.6
 
 Use this skill before character attribution. It discovers source material in place, generates review evidence, creates the internal character-reference draft, and diarizes each episode into episode-local `Speaker01`, `Speaker02`, and so on. It does not require the user to reorganize files or assign final character names. It normally creates no client-facing deliverable, except for the optional Japanese preliminary cast overview described below when the user asks for it.
 
-Preparation feeds one beta1.5 workflow only. Anonymous speaker labels are acoustic clusters, not people: `Speaker01` in episode 1 has no guaranteed identity relationship to `Speaker01` in episode 2. Preparation may segment speech before confirmation, but it does not create named voice identities before the user confirms the complete first-episode mapping and authorizes anchor extraction.
+Preparation feeds one beta1.6 workflow only. Anonymous speaker labels are acoustic clusters, not people: `Speaker01` in episode 1 has no guaranteed identity relationship to `Speaker01` in episode 2. Preparation may segment speech before confirmation, but it does not create named voice identities before the user confirms the complete first-episode mapping and authorizes anchor extraction.
+
+## Workflow track selection (标准方案 / 实验方案)
+
+beta1.6 has two tracks. Every rule in this file applies to both unless the experimental reference says otherwise.
+
+- **standard (标准方案)** — the unchanged beta1.5 behavior: sliding-window anonymous diarization, per-turn voice scoring, and full row-level review evidence.
+- **experimental (实验方案)** — opt-in: optional vocal-stem pre-separation, subtitle-guided anonymous segmentation that treats each trusted SRT cue as one unit, and downstream cluster-level voice scoring, multi-exemplar galleries, and tiered review evidence. Read [references/experimental-track.md](references/experimental-track.md) before running it.
+
+At the start of every new project, before discovery writes anything, ask the user which track to use with one AskUserQuestion prompt, standard first. Use standard when the user does not choose. Pass the choice as `--workflow-track standard|experimental`. It is recorded as `workflow_track` in `handoff_manifest.json`, and the automation skill reads it from there. Keep one track for the whole project. Switching tracks means rebuilding the preparation package and getting it approved again.
 
 ## Required project contract
 
@@ -149,10 +158,10 @@ Build the canonical package only after discovery is unambiguous:
   --identity-model "campplus=$VOICE_MODEL_CAMPLUS" \
   --identity-model "ecapa512=$VOICE_MODEL_ECAPA512" \
   --identity-model "resnet34=$VOICE_MODEL_RESNET34" \
-  --anonymous-device auto
+  --anonymous-device auto --workflow-track standard
 ```
 
-This command defaults to `03_script/01_preparation` and creates `03_script/02_script_work` plus `03_script/03_final_delivery`. Use `--overwrite` only when replacing that exact generated package is intended; never overwrite the two user workbooks.
+Use `--workflow-track experimental` for the experimental track. This command defaults to `03_script/01_preparation` and creates `03_script/02_script_work` plus `03_script/03_final_delivery`. Use `--overwrite` only when replacing that exact generated package is intended; never overwrite the two user workbooks.
 
 ## Generated preparation package
 
@@ -193,6 +202,8 @@ Anonymous diarization is a required preparation artifact. Use a local diarizatio
 
 Keep labels episode-local and ordered by first acoustic appearance. Do not attach character names during preparation. When one subtitle cue overlaps multiple clusters and no speaker owns at least 70% of the detected speech overlap, write `MULTI_SPEAKER_REVIEW`; when no turn overlaps, write `UNRESOLVED`. Never split or rewrite subtitle dialogue merely to make it fit diarization.
 
+In the experimental track, the same output files are built from one embedding per trusted SRT cue instead of sliding windows. The track adds its own review statuses and a `subtitle_segmentation_diagnostics.tsv`. The column contract, labels, and validation are unchanged. See [references/experimental-track.md](references/experimental-track.md).
+
 The diarization backend and the identity encoders have separate jobs. Diarization uses Silero VAD, the official WeSpeaker ECAPA512 ONNX encoder, and local cosine agglomerative clustering to create reviewable anonymous turns. The downstream identity ensemble uses CAM++, ECAPA512, and ResNet34 only after confirmed role anchors exist. WavLM is not part of this workflow. Before a real run, load the local pipeline and all three identity runtimes through preflight; a non-empty directory alone is not readiness. Both build entry points run this gate before writing output. Read-only discovery remains usable when models are unavailable. Run it separately to inspect blockers:
 
 ```bash
@@ -222,7 +233,7 @@ The manual compatibility entry point remains available for unusual projects:
   --anonymous-device auto --voice-device auto
 ```
 
-## beta1.5 first-episode voice anchors
+## beta1.6 first-episode voice anchors
 
 The preparation approval gate and the downstream first-episode speaker confirmation are separate: preparation approval accepts the evidence and internal character baseline, not a character-to-dialogue mapping. The downstream script workflow always completes the first episode and pauses once for whole-episode speaker confirmation. After the user confirms every assignment and authorizes extraction, mark internal gallery reports and checkpoints:
 
@@ -230,7 +241,7 @@ Read [references/beta-voice-anchor-workflow.md](references/beta-voice-anchor-wor
 
 ```text
 workflow_stage=beta
-workflow_version=beta1.5
+workflow_version=beta1.6
 voice_evidence_authority=supporting
 automatic_identity_assignment=false
 ```
@@ -281,4 +292,4 @@ Edits to the optional preliminary cast overview do not by themselves invalidate 
 - Never treat an episode-local `SpeakerNN` cluster as a character identity or carry its number into another episode as identity evidence.
 - Never approve a current-schema preparation package without the anonymous speaker draft.
 - Never enroll episode-derived identities without explicit first-episode confirmation and extraction authorization.
-- Never create user approval or describe the beta1.5 workflow as fully validated production automation.
+- Never create user approval or describe the beta1.6 workflow as fully validated production automation.

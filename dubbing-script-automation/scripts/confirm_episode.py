@@ -428,7 +428,7 @@ def close_episode(
     cp_data["status"] = "full_episode_mapping_confirmed"
     cp_data["user_mapping_confirmed"] = True
     cp_data["workflow_stage"] = "beta"
-    cp_data["workflow_version"] = "beta1.5wsl"
+    cp_data["workflow_version"] = "beta1.6"
     cp_data["episode"] = ep_id
     cp_data["row_count"] = len(rows)
     cp_data["user_confirmation_manifest"] = {

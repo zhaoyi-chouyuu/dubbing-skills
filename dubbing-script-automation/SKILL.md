@@ -1,13 +1,13 @@
 ---
 name: dubbing-script-automation
-description: "Create and revise Japanese short-drama dubbing scripts from the preparation-stage anonymous Speaker draft through one continuous beta1.5wsl workflow: first-episode manual confirmation, a CAM++/ECAPA512/ResNet34 voice ensemble, dialogue/context review, TalkNet supporting evidence, and three final Japanese Excel workbooks. After the first-episode gate, it pauses only at the end of an episode containing a new named speaking role or unresolved named-role identity; otherwise it continues through final delivery."
+description: "Create and revise Japanese short-drama dubbing scripts from the preparation-stage anonymous Speaker draft through one continuous beta1.6 workflow: first-episode manual confirmation, a CAM++/ECAPA512/ResNet34 voice ensemble, dialogue/context review, TalkNet supporting evidence, and three final Japanese Excel workbooks. Runs on the standard track or the opt-in experimental track (cluster-level voice scoring, multi-exemplar galleries, tiered review evidence) recorded in the preparation package. After the first-episode gate, it pauses only at the end of an episode containing a new named speaking role or unresolved named-role identity; otherwise it continues through final delivery."
 metadata:
-  version: "beta1.5wsl"
+  version: "beta1.6"
 ---
 
-# Dubbing Script Automation — beta1.5wsl
+# Dubbing Script Automation — beta1.6
 
-Use this skill only after the preparation package has explicit user approval. Claude Code (the main session) remains the final role reviewer. This skill has one workflow only: **beta1.5**. There is no separate default, experimental, or production branch.
+Use this skill only after the preparation package has explicit user approval. Claude Code (the main session) remains the final role reviewer. This skill has one workflow, **beta1.6**. It runs on either the standard track or the opt-in experimental track recorded in the preparation package (see "Workflow track" below). There is no separate production branch. Both tracks keep every gate, audit, and delivery rule in this file.
 
 ## Highest-priority execution invariant — continuous run and only valid stopping points
 
@@ -41,13 +41,27 @@ These controls are non-optional and exist to prevent a user-corrected episode fr
 3. **Human-approved roles are locked.** Every row imported from the approved workbook must carry `user_locked=true` and `user_locked_role=<approved role>`. Later voice, semantic, visual, normalization, review, QC, and delivery steps may not change that internal role. A different client-facing spelling is allowed only through the already approved Japanese name map; never shorten or generalize an already approved Japanese generic label.
 4. **Formal delivery is atomic.** Build all three workbooks in a sibling staging directory, validate that staging contains exactly the three expected files, and only then replace `03_final_delivery` as one directory-level commit. On failure, preserve the previous delivery unchanged. Do not leave ordinary, corrected, or final variants side by side.
 
-Run the bundled user-confirmation regression test after changing confirmation or delivery code. Its episode-0003 fixture locks `00:00:09,033` to `宦官（モブ）` and `00:00:24,380` to `皇后付き侍女`; either role being dropped or rewritten must fail.
+Run the bundled user-confirmation regression test after changing confirmation or delivery code. Its episode-0003 fixture locks `00:00:09,033` to `宦官（モブ）` and `00:00:24,380` to `皇后付き侍女`; either role being dropped or rewritten must fail. Also run `scripts/test_experimental_track.py` after changing voice scoring, review, audit, QC, or batch-status code. It needs no models or media.
 
-## Single beta1.5 workflow
+## Single beta1.6 workflow
 
 The preparation package supplies an episode-local no-name script whose rows contain `Speaker01`, `Speaker02`, and so on. The first episode is mapped to characters and drafted completely, then paused once for the user to confirm the full character-to-dialogue mapping. After that confirmation, directly extract eligible confirmed single-speaker intervals as named voice anchors; the user's standing workflow instruction authorizes extraction and no separate per-project extraction request is needed. Later episodes start from anonymous acoustic clusters and must attempt CAM++, ECAPA512, and ResNet34. Voice-gallery QC and consensus are evaluated per role: a role may proceed when at least two of the three attempted models have QC-usable profiles and agree on that role, even if the third model disagrees or abstains after role-level QC. Check every voice result against dialogue logic, and use TalkNet only when voice plus logic still cannot resolve the speaker and a reliably mapped speaking face is visible.
 
-If first-episode confirmation or usable anchors are missing, finish that episode's draft, open the normal episode-boundary confirmation gate, and record `no_reliable_gallery` where needed. Do not create an alternate branch or silently weaken the evidence gates. Internal checkpoints use `workflow_stage=beta`; the three client workbooks do not contain internal beta1.5 labels. beta1.5 describes the workflow maturity, not permission to skip final QC or human confirmation.
+If first-episode confirmation or usable anchors are missing, finish that episode's draft, open the normal episode-boundary confirmation gate, and record `no_reliable_gallery` where needed. Do not create an alternate branch or silently weaken the evidence gates. Internal checkpoints use `workflow_stage=beta`; the three client workbooks do not contain internal beta1.6 labels. beta1.6 describes the workflow maturity, not permission to skip final QC or human confirmation.
+
+## Workflow track (标准方案 / 实验方案)
+
+Read `workflow_track` from `<package>/handoff_manifest.json` before the first episode. The value is fixed for the project. If the key is missing (packages from before beta1.6), or its value is `standard`, follow this file exactly as written.
+
+When it is `experimental`, follow [references/experimental-track.md](references/experimental-track.md) for episodes after the confirmed first episode. In short:
+
+- build galleries with `voice_evidence.py build-gallery --scoring-mode exemplar_max`;
+- score each episode's anonymous `SpeakerNN` clusters with `voice_evidence.py score-clusters`, one aggregate per cluster per model, and merge them with `voice_ensemble.py`;
+- record one reviewed decision per cluster in `cluster_decisions.tsv`;
+- expand accepted clusters into light-tier rows with `dubbing_tool.py expand-cluster-decisions`, and write full-tier rows only for the rows it lists as pending;
+- pass `--evidence-tiering` to `apply-review`, `export-blind-audit`, `apply-independent-audit`, and `qc`.
+
+The experimental track changes only how evidence is gathered and recorded. It keeps the continuous-run invariant, both confirmation gates, user locks, the blind audit (sampled for light rows), source-bound QC, the single delivery route, and the Japanese delivery contract. Never mix tracks within one project.
 
 > [!IMPORTANT]
 > **Formal Japanese Delivery Contract**:
@@ -190,7 +204,7 @@ Do not use `merge-voice-evidence` to alter roles or QC with `--require-voice-aud
 ## First-episode voice-anchor gate
 
 > [!CAUTION]
-> The entire workflow is beta1.5 and still requires human confirmation. Mark internal checkpoints `workflow_stage=beta`, `voice_evidence_authority=supporting`, and `automatic_identity_assignment=false`. Do not put these internal labels in the three client-facing Excel files. Client delivery is allowed only after every episode-review gate, semantic/video review, independent audit, and final QC pass. Do not claim 100% automatic accuracy or a validated replacement for human review.
+> The entire workflow is beta1.6 and still requires human confirmation. Mark internal checkpoints `workflow_stage=beta`, `voice_evidence_authority=supporting`, and `automatic_identity_assignment=false`. Do not put these internal labels in the three client-facing Excel files. Client delivery is allowed only after every episode-review gate, semantic/video review, independent audit, and final QC pass. Do not claim 100% automatic accuracy or a validated replacement for human review.
 
 The following gates are mandatory for every project:
 
@@ -211,7 +225,7 @@ Use the anonymous segmentation as structure, confirmed voice identity as the fir
 
 Decision policy:
 
-- reliable three-model ensemble or per-role two-of-three consensus and logic agree: retain both evidence records and confirm through the normal beta1.5 review;
+- reliable three-model ensemble or per-role two-of-three consensus and logic agree: retain both evidence records and confirm through the normal beta1.6 review;
 - logic is clear but voice is weak or unavailable for a non-main role: keep the logic result and record the voice limit;
 - the voice ensemble has three-of-three or per-role two-of-three consensus but logic is incomplete: keep it as a candidate and review the surrounding semantic unit before confirmation;
 - fewer than two eligible models agree on the same role, or the two eligible models disagree: abstain from voice identity and continue with logic;
@@ -294,7 +308,7 @@ Record the TalkNet status and candidate in the normal review evidence. Agreement
 
 ## Review and client delivery
 
-Review every supplied episode and row, preserve an evidence-bearing `review_all.tsv` per episode, run continuity checks, and keep review copies under `02_script_work`. beta1.5 voice artifacts support review but never become the sole identity authority. Apply all corrections through review TSVs, run an independent blind audit that cannot see the current roles or reasoning, return disagreements to normal review, reconcile the approved internal character reference against the completed full-series script, then QC and render all three Japanese Excel workbooks.
+Review every supplied episode and row, preserve an evidence-bearing `review_all.tsv` per episode, run continuity checks, and keep review copies under `02_script_work`. beta1.6 voice artifacts support review but never become the sole identity authority. Apply all corrections through review TSVs, run an independent blind audit that cannot see the current roles or reasoning, return disagreements to normal review, reconcile the approved internal character reference against the completed full-series script, then QC and render all three Japanese Excel workbooks.
 
 ## Render and verify
 

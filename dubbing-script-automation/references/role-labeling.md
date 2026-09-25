@@ -39,7 +39,7 @@ When source audio is Chinese or English and the working SRT is Japanese:
 - use Japanese text to form semantic units and initial candidates;
 - do not treat translated wording as literal source-language proof;
 - escalate omitted subjects, changed address forms, softened tone, or rewritten speaker-relevant meaning;
-- use reviewed original-language acoustic evidence when accepted by the beta1.5 quality gates;
+- use reviewed original-language acoustic evidence when accepted by the beta1.6 quality gates;
 - otherwise inspect continuous source video/audio.
 
 ## One-shot face references
@@ -102,7 +102,7 @@ Use:
 
 No single modality may overwrite a role automatically.
 
-### beta1.5 first-episode anchor workflow
+### beta1.6 first-episode anchor workflow
 
 Use dialogue logic and user-confirmed voice identity as the two primary evidence streams after the mandatory first-episode confirmation gate. For later episodes, score confirmed voice identity first, then independently check the complete dialogue context. For the first episode, use dialogue/video evidence to prepare the mapping for user confirmation; no named gallery exists yet.
 
@@ -110,7 +110,7 @@ Use picture and TalkNet evidence only to support presence, entrance/exit, obviou
 
 For a named role from the approved internal character reference, a first speaking appearance or missing, unreliable, close, or conflicting voice evidence opens an episode-boundary review gate. Do not interrupt at that row: keep the assignment provisional, finish every source row in the current episode, aggregate every new or unresolved named role, and then pause once with a full-episode role review sheet. Do not continue later episodes until the user confirms or edits the complete episode mapping and the episode is rechecked. Silent visual appearances and generic unnamed roles do not open this gate.
 
-This is the single beta1.5 workflow. Voice remains supporting evidence and never assigns a role automatically, even after all user confirmations are resolved.
+This is the single beta1.6 workflow. Voice remains supporting evidence and never assigns a role automatically, even after all user confirmations are resolved.
 
 ## External first-draft audit
 

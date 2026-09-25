@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -72,16 +72,34 @@ USER_CONFIRMATION_FIELDS = [
     "user_locked", "user_locked_role", "user_confirmation_sha256",
     "user_confirmation_row", "user_confirmation_source",
 ]
+# Experimental track only; empty in standard-track rows.
+EXPERIMENTAL_TRACK_FIELDS = [
+    "evidence_tier", "cluster_decision_id", "cluster_row_outlier", "audit_sample",
+]
 TSV_FIELDS = [
     *CORE_TSV_FIELDS, *AUDIT_FIELDS, *RELATIONSHIP_FIELDS, *FACE_FIELDS, *VOICE_FIELDS,
     *DRAFT_FIELDS, *BETA_EVIDENCE_FIELDS, *INDEPENDENT_AUDIT_FIELDS,
-    *USER_CONFIRMATION_FIELDS,
+    *USER_CONFIRMATION_FIELDS, *EXPERIMENTAL_TRACK_FIELDS,
 ]
 REVIEW_FIELDS = [
     "episode", "source_index", "start", "end", "current_role", "current_confidence",
     "current_status", "text", "frame_1", "frame_2", "frame_3", "final_role",
     *DRAFT_FIELDS, *AUDIT_FIELDS, *RELATIONSHIP_FIELDS, *FACE_FIELDS, *VOICE_FIELDS, *BETA_EVIDENCE_FIELDS,
-    *USER_CONFIRMATION_FIELDS,
+    *USER_CONFIRMATION_FIELDS, *EXPERIMENTAL_TRACK_FIELDS,
+]
+CLUSTER_DECISION_FIELDS = [
+    "cluster_decision_id", "episode", "anonymous_speaker", "ensemble_status",
+    "ensemble_candidate", "decision", "decided_role", "semantic_crosscheck", "reviewed_by",
+]
+CONSENSUS_ENSEMBLE_STATUSES = {"consensus_3_of_3", "consensus_2_of_3"}
+LIGHT_TIER_REQUIRED_FIELDS = (
+    "review_confidence", "semantic_unit", "identity_status", "identity_evidence",
+    "reviewed_by", "cluster_decision_id",
+)
+DEFAULT_AUDIT_SAMPLE_RATIO = 0.2
+PENDING_REVIEW_FIELDS = [
+    "episode", "source_index", "start", "end", "text", "anonymous_speaker",
+    "diarization_status", "cluster_decision_id", "pending_reason",
 ]
 BLIND_AUDIT_FIELDS = [
     "episode", "source_index", "start", "end", "text", "frame",
@@ -460,7 +478,81 @@ def valid_audio_interval(value: str) -> bool:
     ))
 
 
-def review_evidence_issues(rows: list[dict[str, str]], allow_legacy: bool = False) -> list[dict[str, Any]]:
+def evidence_tier(row: dict[str, str]) -> str:
+    return (row.get("evidence_tier") or "").strip().casefold()
+
+
+def load_cluster_decisions(path: Path) -> dict[str, dict[str, str]]:
+    if not path.is_file():
+        raise ToolError(f"Cluster decisions TSV not found: {path}")
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        rows = list(reader)
+        missing = set(CLUSTER_DECISION_FIELDS) - set(reader.fieldnames or [])
+    if missing:
+        raise ToolError(f"Cluster decisions TSV is missing columns: {', '.join(sorted(missing))}")
+    decisions: dict[str, dict[str, str]] = {}
+    for row in rows:
+        key = (row.get("cluster_decision_id") or "").strip()
+        if not key or key in decisions:
+            raise ToolError(f"Cluster decisions TSV has an empty or duplicate cluster_decision_id: {key!r}")
+        if (row.get("decision") or "").strip() not in {"accept", "reject"}:
+            raise ToolError(f"Cluster decision {key} must be accept or reject")
+        decisions[key] = row
+    return decisions
+
+
+def light_tier_row_issues(row: dict[str, str], decisions: dict[str, dict[str, str]]) -> list[str]:
+    """Light rows inherit a reviewed cluster decision instead of carrying row-specific prose."""
+    issues = [f"missing_{field}" for field in LIGHT_TIER_REQUIRED_FIELDS if not (row.get(field) or "").strip()]
+    try:
+        confidence = float(row.get("review_confidence", ""))
+    except (TypeError, ValueError):
+        confidence = -1.0
+    if not 0.0 <= confidence <= 1.0:
+        issues.append("invalid_review_confidence")
+    if has_valid_user_lock(row):
+        return issues
+    role = (row.get("role") or "").strip()
+    if not role or is_generic_role(role):
+        issues.append("light_tier_requires_named_role")
+    if (row.get("identity_status") or "").strip() != "confirmed":
+        issues.append("light_tier_identity_not_confirmed")
+    if len(compact_dialogue_text(row.get("identity_evidence", ""))) < 8:
+        issues.append("missing_named_identity_evidence")
+    if (row.get("ensemble_status") or "").strip() not in CONSENSUS_ENSEMBLE_STATUSES:
+        issues.append("light_tier_requires_voice_consensus")
+    elif normalized_name(row.get("ensemble_candidate") or "") != normalized_name(role):
+        issues.append("light_tier_voice_candidate_mismatch")
+    if (row.get("diarization_status") or "").strip() != "single_speaker":
+        issues.append("light_tier_requires_single_speaker_cue")
+    if (row.get("cluster_row_outlier") or "").strip().casefold() != "false":
+        issues.append("light_tier_row_outlier_or_unscored")
+    if (row.get("visual_class") or "").strip() in HIGH_RISK_VISUAL_CLASSES:
+        issues.append("light_tier_high_risk_visual")
+    if any((row.get(field) or "").strip().casefold() in {"true", "1", "yes"} for field in ("relationship_conflict", "audio_conflict", "voice_conflict")):
+        issues.append("light_tier_open_conflict")
+    decision = decisions.get((row.get("cluster_decision_id") or "").strip())
+    if decision is None:
+        issues.append("light_tier_unknown_cluster_decision")
+    else:
+        if (decision.get("decision") or "").strip() != "accept":
+            issues.append("light_tier_cluster_decision_not_accepted")
+        if normalized_name(decision.get("decided_role") or "") != normalized_name(role):
+            issues.append("light_tier_cluster_role_mismatch")
+        if len(compact_dialogue_text(decision.get("semantic_crosscheck", ""))) < 8:
+            issues.append("light_tier_cluster_crosscheck_missing")
+        if normalize_episode_id(decision.get("episode", "")) != normalize_episode_id(row.get("episode", "")):
+            issues.append("light_tier_cluster_episode_mismatch")
+    return issues
+
+
+def review_evidence_issues(
+    rows: list[dict[str, str]],
+    allow_legacy: bool = False,
+    tiering: bool = False,
+    cluster_decisions: dict[str, dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
     if allow_legacy:
         return []
     issues: list[dict[str, Any]] = []
@@ -468,6 +560,18 @@ def review_evidence_issues(rows: list[dict[str, str]], allow_legacy: bool = Fals
     for row_number, row in enumerate(rows, start=2):
         if row.get("status") != "manual":
             continue
+        tier = evidence_tier(row)
+        if tier == "light":
+            if not tiering:
+                issues.append({"row": row_number, "source_index": row.get("source_index", ""), "issue": "light_evidence_tier_requires_tiering_mode"})
+            else:
+                issues.extend(
+                    {"row": row_number, "source_index": row.get("source_index", ""), "issue": issue}
+                    for issue in light_tier_row_issues(row, cluster_decisions or {})
+                )
+            continue
+        if tier not in {"", "full"}:
+            issues.append({"row": row_number, "source_index": row.get("source_index", ""), "issue": "invalid_evidence_tier"})
         manual_rows.append((row_number, row))
         index = row.get("source_index", "")
         for field in (
@@ -639,7 +743,29 @@ def semantic_continuity_issues(rows: list[dict[str, str]]) -> list[dict[str, Any
     return issues
 
 
-def independent_audit_issues(rows: list[dict[str, str]], required: bool = False) -> list[dict[str, Any]]:
+def light_audit_sample(rows: list[dict[str, str]], ratio: float) -> set[str]:
+    """Deterministically pick at least one light row per cluster decision for the blind audit."""
+    by_cluster: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        if evidence_tier(row) == "light" and not has_valid_user_lock(row):
+            by_cluster[(row.get("cluster_decision_id") or "").strip()].append(row)
+    selected: set[str] = set()
+    for members in by_cluster.values():
+        needed = max(1, math.ceil(ratio * len(members)))
+        ordered = sorted(
+            members,
+            key=lambda item: hashlib.sha1(f"{item.get('episode', '')}|{item.get('source_index', '')}".encode("utf-8")).hexdigest(),
+        )
+        selected.update(str(item.get("source_index", "")) for item in ordered[:needed])
+    return selected
+
+
+def independent_audit_issues(
+    rows: list[dict[str, str]],
+    required: bool = False,
+    tiering: bool = False,
+    sample_ratio: float = DEFAULT_AUDIT_SAMPLE_RATIO,
+) -> list[dict[str, Any]]:
     if not required:
         return []
     issues: list[dict[str, Any]] = []
@@ -650,12 +776,17 @@ def independent_audit_issues(rows: list[dict[str, str]], required: bool = False)
         for value in (row.get("reviewed_by") or "", row.get("audio_reviewed_by") or "")
         if value.strip()
     }
+    light_by_cluster: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row_number, row in enumerate(rows, start=2):
         index = row.get("source_index", "")
         if has_valid_user_lock(row):
             # A file-backed, whole-episode user decision is the final human
             # authority for this row and supersedes the internal blind audit.
             continue
+        if tiering and evidence_tier(row) == "light":
+            light_by_cluster[(row.get("cluster_decision_id") or "").strip()].append(row)
+            if (row.get("audit_sample") or "").strip().casefold() != "true":
+                continue
         status = (row.get("independent_audit_status") or "").strip()
         auditor = (row.get("independent_auditor") or "").strip()
         note = compact_dialogue_text(row.get("independent_audit_note", ""))
@@ -669,6 +800,22 @@ def independent_audit_issues(rows: list[dict[str, str]], required: bool = False)
             issues.append({"row": row_number, "source_index": index, "issue": "missing_independent_audit_note"})
     if auditors & generation_reviewers:
         issues.append({"row": 0, "source_index": "", "issue": "independent_auditor_matches_generation_audio_reviewer"})
+    for cluster_id, members in light_by_cluster.items():
+        needed = max(1, math.ceil(sample_ratio * len(members)))
+        sampled = sum(
+            (row.get("audit_sample") or "").strip().casefold() == "true"
+            and (row.get("independent_audit_status") or "").strip() in INDEPENDENT_AUDIT_STATUSES
+            for row in members
+        )
+        if sampled < needed:
+            issues.append({
+                "row": 0,
+                "source_index": ",".join(str(row.get("source_index", "")) for row in members[:12]),
+                "issue": "insufficient_light_tier_audit_sample",
+                "cluster_decision_id": cluster_id,
+                "required": needed,
+                "actual": sampled,
+            })
     return issues
 
 
@@ -3788,6 +3935,9 @@ def cmd_apply_review(args: argparse.Namespace) -> int:
                     row[field] = value
         if "voice_resolution" in review_fields:
             row["voice_resolution"] = (review.get("voice_resolution") or "").strip()
+        for field in EXPERIMENTAL_TRACK_FIELDS:
+            if field in review_fields and field != "audit_sample":
+                row[field] = (review.get(field) or "").strip()
         candidate = (row.get("voice_candidate") or "").strip()
         if row.get("voice_status") == "eligible" and candidate:
             row["voice_conflict"] = (
@@ -3799,9 +3949,13 @@ def cmd_apply_review(args: argparse.Namespace) -> int:
         for row in rows:
             for field in INDEPENDENT_AUDIT_FIELDS:
                 row[field] = ""
+            row["audit_sample"] = ""
     if args.require_all and any(row.get("status") not in {"ok", "manual"} for row in rows):
         raise ToolError("Unresolved rows remain after applying review corrections")
-    evidence_issues = review_evidence_issues(rows, allow_legacy=args.allow_legacy_review)
+    tiering, decisions = tiering_options(args)
+    evidence_issues = review_evidence_issues(
+        rows, allow_legacy=args.allow_legacy_review, tiering=tiering, cluster_decisions=decisions,
+    )
     continuity_issues = semantic_continuity_issues(rows)
     voice_issues = voice_evidence_issues(rows)
     gate_issues = [*evidence_issues, *continuity_issues, *voice_issues]
@@ -3815,9 +3969,21 @@ def cmd_apply_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def tiering_options(args: argparse.Namespace) -> tuple[bool, dict[str, dict[str, str]] | None]:
+    if not getattr(args, "evidence_tiering", False):
+        return False, None
+    if not getattr(args, "cluster_decisions", None):
+        raise ToolError("--evidence-tiering requires --cluster-decisions")
+    return True, load_cluster_decisions(Path(args.cluster_decisions))
+
+
 def cmd_export_blind_audit(args: argparse.Namespace) -> int:
     """Export source evidence without leaking the generated role or its reasoning."""
     rows = read_label_rows(Path(args.tsv))
+    if getattr(args, "evidence_tiering", False):
+        # Unsampled light rows are covered by their audited cluster sample.
+        sample = light_audit_sample(rows, args.audit_sample_ratio)
+        rows = [row for row in rows if evidence_tier(row) != "light" or str(row.get("source_index", "")) in sample]
     out_path = Path(args.out_tsv)
     assert_fresh_output(out_path, args.overwrite)
     ensure_parent(out_path)
@@ -3884,7 +4050,15 @@ def cmd_apply_independent_audit(args: argparse.Namespace) -> int:
         row["independent_audit_status"] = "confirmed"
         row["independent_auditor"] = auditor
         row["independent_audit_note"] = note
-    missing_indices = sorted(set(by_index) - seen)
+    tiering = bool(getattr(args, "evidence_tiering", False))
+    if tiering:
+        for index, row in by_index.items():
+            if evidence_tier(row) == "light":
+                row["audit_sample"] = "true" if index in seen else ""
+    missing_indices = sorted(
+        index for index in set(by_index) - seen
+        if not (tiering and evidence_tier(by_index[index]) == "light")
+    )
     if missing_indices:
         incomplete.extend(missing_indices)
     if disagreements:
@@ -3894,8 +4068,193 @@ def cmd_apply_independent_audit(args: argparse.Namespace) -> int:
         )
     if incomplete:
         raise ToolError(f"Independent audit is incomplete at source_index {', '.join(sorted(set(incomplete))[:20])}")
+    if tiering:
+        sample_issues = [
+            issue for issue in independent_audit_issues(rows, required=True, tiering=True, sample_ratio=args.audit_sample_ratio)
+            if issue["issue"] == "insufficient_light_tier_audit_sample"
+        ]
+        if sample_issues:
+            raise ToolError(
+                "Light-tier audit sample is too small for cluster decisions "
+                f"{', '.join(str(issue.get('cluster_decision_id', '')) for issue in sample_issues[:10])}; "
+                "export the blind audit again with --evidence-tiering."
+            )
     write_label_rows(Path(args.out_tsv), rows, args.overwrite)
     print(f"Independent audit attached: {len(rows)} rows, output={args.out_tsv}")
+    return 0
+
+
+def read_plain_tsv(path: Path, label: str) -> tuple[list[dict[str, str]], set[str]]:
+    if not path.is_file():
+        raise ToolError(f"{label} not found: {path}")
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        return list(reader), set(reader.fieldnames or [])
+
+
+def normalized_cluster_id(value: str) -> str:
+    episode, _, speaker = (value or "").strip().rpartition(":")
+    return f"{normalize_episode_id(episode.removeprefix('cluster:'))}:{speaker}"
+
+
+def cmd_expand_cluster_decisions(args: argparse.Namespace) -> int:
+    """Experimental track: build light-tier review rows from reviewed cluster decisions."""
+    catalog = load_role_list(Path(args.roles))
+    labels = read_label_rows(Path(args.labels))
+    anonymous_rows, _ = read_plain_tsv(Path(args.anonymous_script), "Anonymous script")
+    ensemble_rows, _ = read_plain_tsv(Path(args.ensemble_tsv), "Cluster ensemble TSV")
+    decisions = load_cluster_decisions(Path(args.cluster_decisions))
+    decisions_by_cluster = {normalized_cluster_id(key): (key, row) for key, row in decisions.items()}
+    ensemble_by_cluster = {
+        normalized_cluster_id(row.get("acoustic_turn_id") or ""): row
+        for row in ensemble_rows if (row.get("acoustic_turn_id") or "").startswith("cluster:")
+    }
+    outlier_flags: dict[str, list[str]] = defaultdict(list)
+    model_kinds: set[str] = set()
+    for value in args.cluster_rows_tsv:
+        table, _ = read_plain_tsv(Path(value), "Cluster row TSV")
+        kinds = {(row.get("voice_model_kind") or "").strip() for row in table}
+        if len(kinds) != 1 or "" in kinds or kinds & model_kinds:
+            raise ToolError("Each --cluster-rows-tsv must come from one distinct voice model")
+        model_kinds |= kinds
+        for row in table:
+            outlier_flags[str(row.get("source_index", "")).strip()].append((row.get("row_outlier") or "").strip().casefold())
+    if len(model_kinds) < 2:
+        raise ToolError("Provide the score-clusters row output of every scored model (at least two)")
+    anonymous_by_index = {str(row.get("source_index", "")).strip(): row for row in anonymous_rows}
+    label_indices = [str(row.get("source_index", "")).strip() for row in labels]
+    if set(anonymous_by_index) != set(label_indices):
+        raise ToolError("Anonymous script and label TSV do not cover the same source rows")
+    unit_ids = infer_semantic_unit_ids(labels)
+
+    light: dict[str, dict[str, Any]] = {}
+    pending: list[dict[str, Any]] = []
+    for row in labels:
+        index = str(row.get("source_index", "")).strip()
+        anonymous = anonymous_by_index[index]
+        speaker = (anonymous.get("anonymous_speaker") or "").strip()
+        diarization_status = (anonymous.get("diarization_status") or "").strip()
+        cluster_id = f"{normalize_episode_id(anonymous.get('episode') or row.get('episode', ''))}:{speaker}"
+        decision_key, decision = decisions_by_cluster.get(cluster_id, ("", None))
+        ensemble = ensemble_by_cluster.get(cluster_id)
+
+        def defer(reason: str) -> None:
+            pending.append({
+                "episode": row.get("episode", ""), "source_index": index,
+                "start": row.get("start", ""), "end": row.get("end", ""), "text": row.get("text", ""),
+                "anonymous_speaker": speaker, "diarization_status": diarization_status,
+                "cluster_decision_id": decision_key, "pending_reason": reason,
+            })
+
+        if diarization_status != "single_speaker":
+            defer(f"diarization_status={diarization_status or 'missing'}")
+            continue
+        if decision is None:
+            defer("no cluster decision")
+            continue
+        if (decision.get("decision") or "").strip() != "accept":
+            defer("cluster decision rejected")
+            continue
+        if ensemble is None:
+            defer("no cluster voice evidence")
+            continue
+        status = (ensemble.get("ensemble_status") or "").strip()
+        if status not in CONSENSUS_ENSEMBLE_STATUSES:
+            defer(f"cluster voice {status or 'missing'}")
+            continue
+        canonical = catalog.get(normalized_name(decision.get("decided_role") or ""))
+        if canonical is None:
+            defer("decided role is not in the approved catalog")
+            continue
+        if is_generic_role(canonical):
+            defer("generic roles are reviewed row by row")
+            continue
+        if normalized_name(ensemble.get("ensemble_candidate") or "") != normalized_name(canonical):
+            defer("cluster decision differs from the voice consensus")
+            continue
+        if len(compact_dialogue_text(decision.get("semantic_crosscheck", ""))) < 8:
+            defer("cluster decision lacks a semantic cross-check")
+            continue
+        flags = outlier_flags.get(index, [])
+        if len(flags) != len(model_kinds) or any(flag != "false" for flag in flags):
+            defer("row is a cluster outlier or was not scored by every model")
+            continue
+        light[index] = {
+            "episode": row.get("episode", ""), "source_index": index,
+            "start": row.get("start", ""), "end": row.get("end", ""), "text": row.get("text", ""),
+            "final_role": canonical,
+            "review_confidence": "0.92" if status == "consensus_3_of_3" else "0.90",
+            "semantic_unit": (row.get("semantic_unit") or "").strip() or unit_ids.get(int(index), ""),
+            "visual_class": "not_reviewed",
+            "identity_status": "confirmed",
+            "identity_evidence": (
+                f"{decision_key}: {status} ({ensemble.get('agreeing_models', '')}) -> {canonical}; "
+                f"cluster semantic cross-check by {decision.get('reviewed_by', '')}"
+            ),
+            "coarse_audio_status": "not_required",
+            "audio_conflict": "false",
+            "reviewed_by": (decision.get("reviewed_by") or "").strip() or "claude-code",
+            "reviewer_note": "light tier: inherits the reviewed cluster decision",
+            "anonymous_speaker": speaker,
+            "speaker_candidates": anonymous.get("speaker_candidates", ""),
+            "dominant_overlap_ratio": anonymous.get("dominant_overlap_ratio", ""),
+            "speaker_change_inside_cue": anonymous.get("speaker_change_inside_cue", ""),
+            "diarization_status": diarization_status,
+            "ensemble_status": status,
+            "ensemble_candidate": ensemble.get("ensemble_candidate", ""),
+            "agreeing_models": ensemble.get("agreeing_models", ""),
+            "eligible_models": ensemble.get("eligible_models", ""),
+            "model_candidates_json": ensemble.get("model_candidates_json", ""),
+            "ensemble_reason": ensemble.get("ensemble_reason", ""),
+            "evidence_tier": "light",
+            "cluster_decision_id": decision_key,
+            "cluster_row_outlier": "false",
+        }
+
+    overridden = 0
+    if args.full_review_tsv:
+        full_rows, _ = read_plain_tsv(Path(args.full_review_tsv), "Full review TSV")
+        full_by_index: dict[str, dict[str, str]] = {}
+        for full in full_rows:
+            index = str(full.get("source_index", "")).strip()
+            if not (full.get("final_role") or "").strip():
+                continue
+            if index in full_by_index:
+                raise ToolError(f"Full review TSV has duplicate source_index: {index}")
+            if not (full.get("evidence_tier") or "").strip():
+                full["evidence_tier"] = "full"
+            if evidence_tier(full) != "full":
+                raise ToolError(f"Full review TSV row {index} must use evidence_tier=full")
+            full_by_index[index] = full
+        missing = sorted({item["source_index"] for item in pending} - set(full_by_index), key=int)
+        if missing:
+            raise ToolError(f"Full review TSV is missing pending rows: {', '.join(missing[:20])}")
+        overridden = len(set(full_by_index) & set(light))
+        output = [full_by_index.get(index) or light[index] for index in label_indices if index in full_by_index or index in light]
+    else:
+        output = [light[index] for index in label_indices if index in light]
+
+    for path in (Path(args.out_review_tsv), Path(args.out_pending_tsv)):
+        assert_fresh_output(path, args.overwrite)
+        ensure_parent(path)
+    with Path(args.out_review_tsv).open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REVIEW_FIELDS, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows({field: item.get(field, "") for field in REVIEW_FIELDS} for item in output)
+    with Path(args.out_pending_tsv).open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PENDING_REVIEW_FIELDS, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(pending)
+    print(json.dumps({
+        "light_rows": len(light) - overridden,
+        "pending_full_review_rows": len(pending),
+        "full_review_overrides_of_light_rows": overridden,
+        "pending_reasons": dict(Counter(item["pending_reason"] for item in pending)),
+        "review_tsv": str(Path(args.out_review_tsv).resolve()),
+        "pending_tsv": str(Path(args.out_pending_tsv).resolve()),
+        "merged_full_review": bool(args.full_review_tsv),
+        "automatic_identity_assignment": False,
+    }, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -3955,10 +4314,15 @@ def cmd_qc(args: argparse.Namespace) -> int:
             issues.append({"row": row_number, "source_index": index, "issue": "role_not_in_catalog"})
         if not row.get("text", ""):
             issues.append({"row": row_number, "source_index": index, "issue": "empty_text"})
-    evidence_issues = review_evidence_issues(rows, allow_legacy=args.allow_legacy_review)
+    tiering, decisions = tiering_options(args)
+    evidence_issues = review_evidence_issues(
+        rows, allow_legacy=args.allow_legacy_review, tiering=tiering, cluster_decisions=decisions,
+    )
     continuity_issues = semantic_continuity_issues(rows)
     voice_issues = voice_evidence_issues(rows, require_audit=args.require_voice_audit)
-    independent_issues = independent_audit_issues(rows, required=True)
+    independent_issues = independent_audit_issues(
+        rows, required=True, tiering=tiering, sample_ratio=args.audit_sample_ratio,
+    )
     voice_summary = voice_evidence_summary(rows)
     issues.extend(evidence_issues)
     issues.extend(continuity_issues)
@@ -4006,6 +4370,13 @@ def cmd_qc(args: argparse.Namespace) -> int:
         "issues": len(issues),
         "issue_rows": issues,
     }
+    if tiering:
+        decisions_path = Path(args.cluster_decisions)
+        summary["evidence_tiering"] = True
+        summary["cluster_decisions"] = {"path": str(decisions_path.resolve()), "sha256": sha256_file(decisions_path)}
+        summary["audit_sample_ratio"] = args.audit_sample_ratio
+        summary["light_tier_rows"] = sum(evidence_tier(row) == "light" for row in rows)
+        summary["full_tier_rows"] = len(rows) - summary["light_tier_rows"]
     if args.report:
         write_json_atomic(Path(args.report), summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -4237,6 +4608,24 @@ def qc_snapshot_issues(payload: dict[str, Any], labels: Path, require_source: bo
     return []
 
 
+def qc_report_tiering(payload: Any) -> tuple[bool, dict[str, dict[str, str]] | None, float, list[str]]:
+    """Re-apply an episode's recorded evidence tiering only when its decision file is unchanged."""
+    if not isinstance(payload, dict) or payload.get("evidence_tiering") is not True:
+        return False, None, DEFAULT_AUDIT_SAMPLE_RATIO, []
+    snapshot = payload.get("cluster_decisions") or {}
+    path = Path(str(snapshot.get("path") or ""))
+    try:
+        ratio = float(payload.get("audit_sample_ratio", DEFAULT_AUDIT_SAMPLE_RATIO))
+    except (TypeError, ValueError):
+        ratio = DEFAULT_AUDIT_SAMPLE_RATIO
+    if not path.is_file() or sha256_file(path) != snapshot.get("sha256"):
+        return True, {}, ratio, ["cluster_decisions_snapshot_mismatch"]
+    try:
+        return True, load_cluster_decisions(path), ratio, []
+    except ToolError as exc:
+        return True, {}, ratio, [f"cluster_decisions_invalid:{exc}"]
+
+
 def collect_batch_status(root: Path, expected_episode_ids: list[str] | None = None) -> dict[str, Any]:
     if not root.is_dir():
         raise ToolError(f"Batch root not found: {root}")
@@ -4264,20 +4653,30 @@ def collect_batch_status(root: Path, expected_episode_ids: list[str] | None = No
             "qc_snapshot_issues": [],
             "production_ready": False,
         }
+        payload: Any = None
+        payload_error = False
+        if report.is_file():
+            try:
+                payload = json.loads(report.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                payload_error = True
         if labels.is_file():
             rows = read_label_rows(labels)
             item["lines"] = len(rows)
             item["confirmed"] = sum(row.get("status") in {"ok", "manual"} for row in rows)
             item["unresolved"] = len(rows) - item["confirmed"]
             item["reviewed_all"] = bool(rows) and all(row.get("status") == "manual" for row in rows)
+            tiering, decisions, ratio, tiering_issues = qc_report_tiering(payload)
             item["delivery_gate_issues"] = (
-                len(review_evidence_issues(rows))
+                len(review_evidence_issues(rows, tiering=tiering, cluster_decisions=decisions))
                 + len(semantic_continuity_issues(rows))
-                + len(independent_audit_issues(rows, required=True))
+                + len(independent_audit_issues(rows, required=True, tiering=tiering, sample_ratio=ratio))
+                + len(tiering_issues)
             )
         if report.is_file():
             try:
-                payload = json.loads(report.read_text(encoding="utf-8"))
+                if payload_error:
+                    raise ValueError("unreadable QC report")
                 item["qc_issues"] = int(payload.get("issues", -1))
                 item["production_ready"] = bool(payload.get("production_ready", False))
                 item["qc_snapshot_issues"] = qc_snapshot_issues(payload, labels, require_source=True) if labels.is_file() else ["final_roles_missing"]
@@ -5288,6 +5687,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Compatibility escape hatch for old review sheets without structured evidence; never use for production delivery",
     )
+    apply_review.add_argument("--evidence-tiering", action="store_true", help="Experimental track: accept light-tier rows that inherit a reviewed cluster decision")
+    apply_review.add_argument("--cluster-decisions", help="Experimental track: reviewed cluster_decisions.tsv (required with --evidence-tiering)")
     apply_review.add_argument("--overwrite", action="store_true")
     apply_review.set_defaults(func=cmd_apply_review)
 
@@ -5297,6 +5698,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     blind_audit.add_argument("--tsv", required=True)
     blind_audit.add_argument("--out-tsv", required=True)
+    blind_audit.add_argument("--evidence-tiering", action="store_true", help="Experimental track: accept light-tier rows that inherit a reviewed cluster decision")
+    blind_audit.add_argument("--audit-sample-ratio", type=float, default=DEFAULT_AUDIT_SAMPLE_RATIO, help="Experimental track: share of light rows per cluster decision sent to the blind audit (minimum one)")
     blind_audit.add_argument("--overwrite", action="store_true")
     blind_audit.set_defaults(func=cmd_export_blind_audit)
 
@@ -5307,8 +5710,26 @@ def build_parser() -> argparse.ArgumentParser:
     apply_audit.add_argument("--tsv", required=True)
     apply_audit.add_argument("--audit-tsv", required=True)
     apply_audit.add_argument("--out-tsv", required=True)
+    apply_audit.add_argument("--evidence-tiering", action="store_true", help="Experimental track: accept light-tier rows that inherit a reviewed cluster decision")
+    apply_audit.add_argument("--audit-sample-ratio", type=float, default=DEFAULT_AUDIT_SAMPLE_RATIO)
     apply_audit.add_argument("--overwrite", action="store_true")
     apply_audit.set_defaults(func=cmd_apply_independent_audit)
+
+    expand = subparsers.add_parser(
+        "expand-cluster-decisions",
+        help="Experimental track: turn reviewed cluster decisions into light-tier review rows and list rows that still need full review",
+    )
+    expand.add_argument("--labels", required=True, help="Episode label TSV that apply-review will update")
+    expand.add_argument("--anonymous-script", required=True, help="Preparation anonymous_script.tsv for the episode")
+    expand.add_argument("--ensemble-tsv", required=True, help="voice_ensemble.py output over score-clusters evidence")
+    expand.add_argument("--cluster-rows-tsv", action="append", required=True, help="score-clusters --out-rows-tsv of each scored model; repeat")
+    expand.add_argument("--cluster-decisions", required=True)
+    expand.add_argument("--roles", required=True)
+    expand.add_argument("--out-review-tsv", required=True)
+    expand.add_argument("--out-pending-tsv", required=True)
+    expand.add_argument("--full-review-tsv", help="Full-tier review rows for every pending row; merged into --out-review-tsv")
+    expand.add_argument("--overwrite", action="store_true")
+    expand.set_defaults(func=cmd_expand_cluster_decisions)
 
     merge_voice = subparsers.add_parser(
         "merge-voice-evidence",
@@ -5338,6 +5759,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip structured review-evidence checks for migration diagnostics only",
     )
+    qc.add_argument("--evidence-tiering", action="store_true", help="Experimental track: accept light-tier rows that inherit a reviewed cluster decision")
+    qc.add_argument("--cluster-decisions", help="Experimental track: reviewed cluster_decisions.tsv (required with --evidence-tiering)")
+    qc.add_argument("--audit-sample-ratio", type=float, default=DEFAULT_AUDIT_SAMPLE_RATIO)
     qc.add_argument("--fail-on-issues", action="store_true")
     qc.set_defaults(func=cmd_qc)
 
