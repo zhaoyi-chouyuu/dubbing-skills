@@ -61,7 +61,7 @@ def fixture_rows(first_role: str, second_role: str) -> list[dict[str, str]]:
         "provider": "regression", "model": "fixture", "review_confidence": "0.80",
         "identity_status": "uncertain", "visual_class": "not_reviewed",
         "coarse_audio_status": "not_required", "audio_conflict": "false",
-        "reviewed_by": "claude-code", "reviewer_note": "episode-specific structured review",
+        "reviewed_by": "codex", "reviewer_note": "episode-specific structured review",
     }
     return [
         {

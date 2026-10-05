@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dubbing Script Preparation beta1.5wsl"
+  short_description: "Prepare beta1.5wsl evidence and optional early Japanese cast overview"
+  default_prompt: "Use $dubbing-script-preparation in beta1.5wsl mode to discover my source materials in place, optionally deliver the Japanese preliminary cast overview first when I request it, create episode-local Speaker01/Speaker02 diarization drafts without character names, build the internal character evidence under 03_script, validate the package, and wait for my approval before formal script automation."

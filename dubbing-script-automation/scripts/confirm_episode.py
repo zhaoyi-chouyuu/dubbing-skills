@@ -383,7 +383,7 @@ def close_episode(
         if not (r.get("identity_evidence") or "").strip():
             r["identity_evidence"] = f"User approved the complete episode mapping: {approval_note}"
         if not (r.get("reviewed_by") or "").strip():
-            r["reviewed_by"] = "claude_code_then_user"
+            r["reviewed_by"] = "codex_then_user"
         if not (r.get("reviewer_note") or "").strip():
             r["reviewer_note"] = approval_note
     for field in ("identity_evidence", "reviewed_by", "reviewer_note"):
@@ -428,7 +428,7 @@ def close_episode(
     cp_data["status"] = "full_episode_mapping_confirmed"
     cp_data["user_mapping_confirmed"] = True
     cp_data["workflow_stage"] = "beta"
-    cp_data["workflow_version"] = "beta1.6"
+    cp_data["workflow_version"] = "beta1.5wsl"
     cp_data["episode"] = ep_id
     cp_data["row_count"] = len(rows)
     cp_data["user_confirmation_manifest"] = {

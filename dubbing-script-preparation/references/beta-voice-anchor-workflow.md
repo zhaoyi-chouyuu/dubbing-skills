@@ -1,18 +1,18 @@
-# beta1.6 voice-anchor handoff
+# beta1.5 voice-anchor handoff
 
-Preparation supports one beta1.6 workflow. It first creates episode-local anonymous `SpeakerNN` turns and a no-name script draft, plus the episode-1 review evidence and a blank voice-enrollment template. It does not derive named voice anchors before manual confirmation.
+Preparation supports one beta1.5 workflow. It first creates episode-local anonymous `SpeakerNN` turns and a no-name script draft, plus the episode-1 review evidence and a blank voice-enrollment template. It does not derive named voice anchors before manual confirmation.
 
 After the script workflow completes episode 1, the user checks the full character-to-dialogue mapping. Only user-confirmed named-role intervals may then enter the voice gallery, and only after explicit extraction authorization.
 
 Use the full operating rules in:
 
-`C:\Users\zhao-\.claude\skills\dubbing-script-automation\references\beta-voice-anchor-workflow.md`
+`C:\Users\zhao-\.agents\skills\dubbing-script-automation\references\beta-voice-anchor-workflow.md`
 
 The handoff must preserve the first-episode source hashes and use these internal markers:
 
 ```text
 workflow_stage=beta
-workflow_version=beta1.6
+workflow_version=beta1.5
 voice_evidence_authority=supporting
 automatic_identity_assignment=false
 ```

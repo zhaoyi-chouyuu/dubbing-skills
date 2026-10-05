@@ -1,6 +1,6 @@
-# beta1.6 voice-anchor workflow
+# beta1.5 voice-anchor workflow
 
-This is the only voice workflow used by `dubbing-script-automation`. Voice identity is supporting evidence inside a human-confirmed beta1.6 process; it never assigns or changes a speaker automatically.
+This is the only voice workflow used by `dubbing-script-automation`. Voice identity is supporting evidence inside a human-confirmed beta1.5 process; it never assigns or changes a speaker automatically.
 
 Attempt all three independent speaker-identity models. Evaluate QC per role. Two matching eligible votes out of the three attempted models are sufficient for that role; the third model may disagree or abstain after documented role-level QC. WavLM is not part of this workflow:
 
@@ -9,8 +9,8 @@ Attempt all three independent speaker-identity models. Evaluate QC per role. Two
 - ECAPA512 model: `E:\AI_Models\pyannote\wespeaker-voxceleb-ecapa-tdnn512`
 - ResNet34 model: `E:\AI_Models\pyannote\wespeaker-voxceleb-resnet34-LM`
 - FFmpeg: `E:\AI_Models\RVC\RVC20240604Nvidia50x0\ffmpeg.exe`
-- voice tool: `C:\Users\zhao-\.claude\skills\dubbing-script-automation\scripts\voice_evidence.py`
-- ensemble tool: `C:\Users\zhao-\.claude\skills\dubbing-script-automation\scripts\voice_ensemble.py`
+- voice tool: `C:\Users\zhao-\.agents\skills\dubbing-script-automation\scripts\voice_evidence.py`
+- ensemble tool: `C:\Users\zhao-\.agents\skills\dubbing-script-automation\scripts\voice_ensemble.py`
 
 Run a real preflight for all three models before scoring. Missing any model directory or a failed runtime preflight blocks the run. Two-of-three consensus is permitted only after all three model pipelines were attempted; an unavailable model is not an abstaining vote. Do not silently reduce the ensemble to the installed subset and do not replace a missing model with WavLM.
 
@@ -44,7 +44,7 @@ role	episode	media_path	start	end	verified	overlap	mixed_speaker	music_dominant	
 
 Use exact confirmed role names and source-media intervals. Set `verified=true` only for user-confirmed, continuous, single-speaker intervals. Reject mixed speakers, overlap, dominant music/effects, phone processing, severe distortion, uncertain boundaries, and clips outside the duration gate. Keep enrollment anchors and held-out consistency clips disjoint.
 
-A practical beta1.6 gate is at least three accepted clips and eight accepted seconds per role, with each clip between two and twelve seconds. Apply it separately to each role in each model. A failed or confusable role profile is excluded only from that model's candidate set; it does not invalidate other QC-usable roles in the same model. If fewer than two models have a usable profile for a character, record `no_reliable_gallery`; never weaken the gate or borrow another role's voice.
+A practical beta1.5 gate is at least three accepted clips and eight accepted seconds per role, with each clip between two and twelve seconds. Apply it separately to each role in each model. A failed or confusable role profile is excluded only from that model's candidate set; it does not invalidate other QC-usable roles in the same model. If fewer than two models have a usable profile for a character, record `no_reliable_gallery`; never weaken the gate or borrow another role's voice.
 
 Attempt three separate galleries from the exact same confirmed manifest, one per model. Each report must list `usable_roles` and role-level rejection reasons. Score the exact same reviewed acoustic-turn manifest against all scoreable role subsets. If a model has fewer than two QC-usable roles and therefore cannot score, preserve its failed report as the third-model attempt. Never mix embeddings from different models in one gallery.
 
@@ -89,7 +89,7 @@ Internal reports must state:
 
 ```text
 workflow_stage=beta
-workflow_version=beta1.6
+workflow_version=beta1.5
 voice_evidence_authority=supporting
 automatic_identity_assignment=false
 ```

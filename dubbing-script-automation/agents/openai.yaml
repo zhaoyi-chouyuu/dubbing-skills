@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dubbing Script Automation beta1.5wsl"
+  short_description: "Run the beta1.5wsl workflow and deliver three Japanese workbooks"
+  default_prompt: "Use $dubbing-script-automation in beta1.5wsl mode to map the approved anonymous Speaker draft to characters: finish episode 1, pause for my full mapping confirmation, build only authorized CAM++/ECAPA512/ResNet34 anchors, check voice results against dialogue logic, use TalkNet only for unresolved visible-speaker cases, and deliver three independent Japanese Excel workbooks."
