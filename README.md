@@ -8,7 +8,7 @@
 | `dubbing-script-automation` | 配音台本自动化（beta1.6），交付三份日文 Excel |
 | `dubbing-vocal-assembly` | 按台本/字幕逐句剪辑并对齐配音 |
 | `subtitle-align-skill-gpu` | V26 字幕时间码对齐（WhisperX GPU） |
-| `anime-jp-zh-subtitles-test` | 动画视频日语字幕实验流程（TEST v0.8；将按实际素材迭代，尚未验证大批量处理） |
+| `anime-jp-zh-subtitles-test` | 动画视频日语字幕实验流程（TEST v0.9；采用项目字幕格式规范，按实际素材迭代，尚未验证大批量处理） |
 | `shortdrama-text-standards` | 短剧字幕文本规范与质检 |
 | `cms-jp-postdub-subtitle-formatting` | 配音后日文字幕格式整理 |
 | `cosyvoice3-voice-cloning` | CosyVoice3 声音克隆 WebUI |
