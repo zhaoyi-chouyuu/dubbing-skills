@@ -134,7 +134,9 @@ def inspect_ct2_model(folder, repo):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--turbo-model', default=str(default_turbo_path()))
+    parser.add_argument('--asr-mode', choices=['single', 'dual'], default='single')
+    parser.add_argument('--primary-model', choices=['anime', 'turbo'], default='anime')
+    parser.add_argument('--turbo-model', default=None)
     parser.add_argument('--anime-model', default=str(Path('E:/AI_Models/anime-whisper') if os.name == 'nt' else Path.home() / 'models/anime-whisper'))
     parser.add_argument('--report', type=Path)
     args = parser.parse_args()
@@ -144,24 +146,41 @@ def main():
             packages[name] = metadata.version(name)
         except metadata.PackageNotFoundError:
             packages[name] = None
-    turbo = inspect_ct2_model(args.turbo_model, TURBO_REPO)
-    anime = inspect_model(args.anime_model, 'litagin/anime-whisper')
-    turbo['role'] = 'primary_transcript_coarse_location'
-    anime['role'] = 'text_review_only_no_segmentation_or_timing'
-    required = ['torch', 'transformers', 'faster-whisper', 'ctranslate2', 'numpy']
+    selected = [args.primary_model]
+    if args.asr_mode == 'dual':
+        selected.append('turbo' if args.primary_model == 'anime' else 'anime')
+    models = {}
+    for name in selected:
+        if name == 'anime':
+            models[name] = inspect_model(args.anime_model, 'litagin/anime-whisper')
+        else:
+            models[name] = inspect_ct2_model(args.turbo_model or default_turbo_path(), TURBO_REPO)
+        models[name]['role'] = ('primary_transcript_or_reference_check' if name == selected[0]
+                                else 'explicit_secondary_independent_review')
+    required = ['numpy']
+    if 'anime' in selected:
+        required += ['torch', 'transformers']
+    if 'turbo' in selected:
+        required += ['faster-whisper', 'ctranslate2']
     missing = [n for n in required if packages[n] is None]
-    blocked = bool(turbo['errors'] or anime['errors'] or missing)
+    blocked = bool(any(m['errors'] for m in models.values()) or missing)
+    secondary = (models[selected[1]] if len(selected) == 2 else
+                 {'status': 'skipped_by_config', 'model_loaded': False,
+                  'dependency_check_performed': False})
     result = {'status': 'blocked_dependency' if blocked else 'preflight_only',
               'python': platform.python_version(), 'packages_current_interpreter': packages,
-              'missing_packages_current_interpreter': missing, 'asr_a': turbo, 'asr_b': anime,
-              'model_families_distinct': False, 'timing_backend': 'not_selected_without_media',
+              'missing_packages_current_interpreter': missing,
+              'asr_mode': args.asr_mode, 'asr_primary_name': args.primary_model,
+              'asr_a': models[selected[0]], 'asr_b': secondary,
+              'model_families_distinct': False if len(selected) == 2 else None,
+              'timing_backend': 'not_selected_without_media',
               'timing_modes_supported': ['v26', 'trusted_reference'],
               'timing_mode_default': 'v26',
               'timing_scope_default': 'full_authorized_dialogue',
               'trusted_reference_requires_explicit_user_request': True,
               'reference_languages_supported': ['en', 'ja'],
               'media_processed': False, 'models_loaded': False, 'cuda_checked': False,
-              'note': 'Other isolated environments require their own check; this does not establish inference readiness.'}
+              'note': 'Only selected ASR dependencies checked; no model loading or media processing.'}
     data = json.dumps(result, ensure_ascii=True, indent=2)
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)

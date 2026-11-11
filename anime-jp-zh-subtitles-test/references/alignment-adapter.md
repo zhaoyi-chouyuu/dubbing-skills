@@ -4,20 +4,20 @@
 
 当前可用基础是 `subtitle-align-skill-gpu` 的 V26，不是原稿 Mac 的 `subtitle-alignment-jp/scripts/align_single.py`。这里说明复用边界，不声称新联合对齐适配器已经实现。
 
-WSL 入口：`/home/zhaoyi/.openclaw/workspace/master_aligner_v26.py`。调用前检查源码与签名，以实际安装版本为准：
+DeepSeek 锁定 WSL 入口：`/mnt/c/Users/zhao-/.dsh/skills/subtitle-align-skill-gpu/master_aligner_v26.py`。调用前检查源码与签名，以实际安装版本为准：
 
 - `align_one(audio_path, srt_path, output_path, vad_mode="hybrid")`：自带 Phase 0 结构预处理；返回原字幕、结果、波形、采样率、字符时间线与 VAD 岛。
-- `quality_check_and_autofix(...)`：会修改结果并覆盖输出，不是只读 QC 接口。旧版本会因 WHISPER_EMPTY/SILENT 将字幕缩到 0.5 秒；本实验不得把这种操作当作复核结论。可在隔离副本上分析报告并拒绝启发式改时，或写只读 QC 适配器。
+- `quality_check_and_autofix(...)`：会修改结果并覆盖输出，不是只读 QC 接口。当前锁定版会因 WHISPER_EMPTY/SILENT 将字幕缩到 0.5 秒；本实验不得把这种操作当作复核结论。如该接口会加载另一 Whisper/Turbo/medium ASR，默认单模型模式下不调用；只有本次明确要求第二模型才启用。在授权分支也应拒绝启发式改时，或使用只读 QC 适配器。
 
 不要直接修改正式引擎来试验。为新适配器保留源版本/哈希、独立路径与验证记录；缺少必要能力时阶段记 blocked_dependency/needs_review，不能静默改为复用旧轴并报告全量对齐完成。
 
 ## 可信文本和粗定位
 
-先从双路及声音证据确认日语。乱码、异常重复、疑似截断、候选不对应声音时返回听写复核，不能强制挤入一段音频。不要把旧稿按固定字数硬切，再按字数平均分配的时间当精确锚点。
+默认结合 Anime Whisper 单模型输出与声音证据确认日语；明确启用双模型时才另比较两路。乱码、异常重复、疑似截断、候选不对应声音时返回听写复核，不能强制挤入一段音频。不要把旧稿按固定字数硬切，再按字数平均分配的时间当精确锚点。
 
 日语校对分支中，听不清而保留底稿的条目可保留原文字和内容疑点进入候选对齐；记录其匹配、失败或回退，不因一次对齐分数高就标文字 confirmed。个别条目无法确认时继续处理其余单位，不因此跳过整集的全量首轮。
 
-粗定位来自经核查的 Turbo 原音窗口/segments；旧字幕只提供找回上下文的线索，不能用原窄句框锁住有误入出点。Anime Whisper 仅审查文字，其标点、生成块、窗口及词时间不作为断句或 timing 依据。断句结合确认文本的语义、原音停顿和说话人交接；Turbo 原生分段和原字幕断句均不自动视为最终字幕块。
+粗定位默认来自已核查的 Anime Whisper 原音输入窗口；仅明确选用 Turbo 时可用其 segments 辅助；旧字幕只提供找回上下文的线索，不能用原窄句框锁住有误入出点。Anime Whisper 默认提供主稿文字，其标点、生成块、窗口及词时间不作为断句或 timing 依据。断句结合确认文本的语义、原音停顿和说话人交接；任何 ASR 原生分段和原字幕断句均不自动视为最终字幕块。
 
 最终对白 timing 采用既有 V26 方法。先为完整授权范围建立应交付发话单位清单，逐集/分段执行全部单位的首轮对齐并保存处理记录；不能只挑异常行运行。句内旧边界不可靠时，将连续且同一顺序的日语合并为有声音粗定位的短块，保留单位/字符映射，联合对齐后拆回语义块。真实同时发声的不同人不能拼成一串顺序文本硬对齐，应在各自可核查范围分别处理后重组双人字幕；接口不支持且无法确认时记录失败/待核。画面字从音频输入中分离，逐条按当前视频帧核时，再合回最终 SRT。首轮后改字、补句或改断句只重算受影响范围及相邻接缝；失败保留粗范围和标记，不用 fill_unmatched_timings 的估计冒充匹配。
 
@@ -36,3 +36,16 @@ WSL 入口：`/home/zhaoyi/.openclaw/workspace/master_aligner_v26.py`。调用�
 - 保留真正的重叠对白与短应答。背景音乐/拖音中的 VAD 不是对白边界真值；歌曲不用对白裁尾规则。
 - 对完整授权范围核销全部发话单位的本轮处理状态，区分实际匹配、估计回退、失败与待核；不能只读总体成功计数。全音轨漏句检查与对齐行级 QC 两者都要做。写出可解析、无意外重叠的 SRT 仅是文件结构检查。
 - 中文从经确认的日语和映射产生，不作为日语对齐模型的输入。
+
+
+## DeepSeek 同步工具与执行门（2026-11-11）
+
+源目录 `/mnt/c/Users/zhao-/.dsh/skills/subtitle-align-skill-gpu`；宿主完整同步副本 `/mnt/c/Users/zhao-/.agents/skills/subtitle-align-skill-gpu`。以实际 `engine.sha256` 为准，文档历史 hash 不作为锁。先运行宿主 `check_env_strict.sh`（调用原版 `check_env.sh`，拦截打印的 FAIL 并强制检查依赖导入、CUDA及宿主/真源哈希锁）；原脚本部分 FAIL 不累加退出码，不能只看 exit=0。GPU 不可用时停止 GPU 批次，记录原因后才评估 CPU 备选。
+
+导入只用源目录并核对 `M.__file__` 与 SHA256。调用 `align_one(..., vad_mode="hybrid")`；不裸跑浮动 `batch_process`。采用当前引擎实际值：停顿≥1.5秒切块、≥12秒且停顿≥0.5秒切块、25秒强制切、前后各2秒；Phase 5 最短0.4秒、间隔0.033秒。不得按旧文档改成0.5秒/50ms。
+
+标准 DeepSeek 流程后接 `quality_check_and_autofix(subs, results, y, sr, islets, out)`，该函数会加载 medium 并覆盖候选输出。anime test 的单 ASR 主稿模式保留：未获本次第二 ASR 指示时不调用它，另存本流程行级声音 QC，并如实注明 DeepSeek medium/QC 未执行，不伪造对应报告。获授权调用时先保存 align_one 输出与结果快照，再审读全部 flagged、Auto-Fix 和前后边界；SILENT/WHISPER_EMPTY 的固定压至0.5秒只是候选启发式，不能据其直接定稿。原版引擎不改语义，替换或修正须另做 A/B。
+
+对对白对齐输入及候选分别执行源 `validate_srt.py --self` / `<input> <output>`，并执行宿主 `check_delivery.py <input> <output>`。补充检查会严格拒绝空稿/坏块/非正时长、序号错误、原稿与成品任意文字或换行变化、顺序对白<33ms间隔（2ms容差），并返回极短夹带待核项。先读 [极短残留规则](short-transition-review.md)：真实重复和双人同文不得进入 Phase 0 自动去重；画面字从纯对齐输入中分离，合回后用原始映射验证文字/时间未遭非授权改变。真实叠说的组内时码只按独立证据核验，不能把全片最终混合字幕硬套顺序对白间隔。
+
+纯对齐的 COUNT/TEXT 以冻结的对白输入为基线。需要补句、删冗余或重排换行时，先在已授权文字阶段保存修订与源/输出 ID 映射，再冻结新基线；不得在对齐阶段静默清洗。真实重复导致原版 DUP FAIL 时保留该结果及复核证据，状态为保护项/待核，不谎报原版全部 PASS。
